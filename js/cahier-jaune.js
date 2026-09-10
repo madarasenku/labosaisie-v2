@@ -124,6 +124,7 @@ async function chargerCahierJaune(mois) {
   if (sel) sel.value = _cahierMois;
   if (typeof _sb === 'undefined' || !_sb) return;
 
+
   try {
     showLoading('Chargement du cahier…');
     const { data, error } = await _sb.rpc('get_cahier_jaune',
@@ -133,6 +134,10 @@ async function chargerCahierJaune(mois) {
       const z = document.getElementById('cahier-tableau');
       if (z) z.innerHTML = '<div style="color:#b91c1c">'
         + (data?.erreur === 'forbidden'
+            ? 'Le cahier jaune ne vous est pas ouvert.'
+            : data?.erreur === 'coffre_ferme'
+            // Même phrase que pour un refus ordinaire : dire « coffre fermé »
+            // annoncerait qu'il existe une autre façon d'entrer.
             ? 'Le cahier jaune ne vous est pas ouvert.'
             : 'Cahier indisponible' + (data?.erreur ? ' (' + data.erreur + ')' : ''))
         + '</div>';
