@@ -8,8 +8,8 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Mes patients">
-<link rel="stylesheet" href="./vendor/fonts/poppins.css?v=13.102">
-<script src="./vendor/supabase-2.39.7.umd.js?v=13.102"></script>
+<link rel="stylesheet" href="./vendor/fonts/poppins.css?v=13.161">
+<script src="./vendor/supabase-2.39.7.umd.js?v=13.161"></script>
 <style>
   /* Page volontairement autonome : elle ne charge NI app.css NI les modules
      du laboratoire. Un soignant qui ouvre son portail sur un téléphone en
@@ -77,26 +77,13 @@
   .vide{text-align:center;color:#64748b;padding:38px 12px}
 
   @media print{
-    header,.barre,.stats-bar,#bandeau-site-v2{display:none!important}
+    header,.barre,.stats-bar{display:none!important}
     .fiche{box-shadow:none;border:1px solid #ccc;break-inside:avoid}
     .fiche-corps{display:block!important}
   }
 </style>
 </head>
 <body>
-
-<!-- ⚠️ SITE SECONDAIRE — voir le commentaire dans index.html -->
-<div id="bandeau-site-v2" role="status">
-  ⚠️ SITE SECONDAIRE — base de données distincte de la production.
-  <span>Les saisies faites ici ne remontent PAS sur le site principal.</span>
-</div>
-<style>
-  #bandeau-site-v2{position:sticky;top:0;z-index:99999;background:#c2410c;color:#fff;
-    font:600 13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;text-align:center;
-    padding:7px 12px;letter-spacing:.2px;box-shadow:0 2px 6px rgba(0,0,0,.28)}
-  #bandeau-site-v2 span{display:block;font-weight:400;opacity:.92;font-size:12px}
-  @media print{#bandeau-site-v2{display:none}}
-</style>
 
 <header>
   <h1>Mes patients au laboratoire</h1>
@@ -123,9 +110,9 @@
 <script>
 /* Mêmes clés préfixées que le reste du site secondaire : le localStorage est
    partagé par tout le domaine (voir README). */
-const SESSION_KEY = 'v2_labo_session_user';
-const SUPABASE_URL = 'https://ftwsxdivwoczsreiohok.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_de9EPaXmi3QSXMqSSoGuKg_kwWw9Yth';
+const SESSION_KEY = 'labo_session_user';
+const SUPABASE_URL = 'https://uvxxbihlagfncraokqlg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_RPgz6piVcNONZOOcLmOCQw_5YPxZTd6';
 
 let _sb = null, _session = null, _fiches = [];
 /* Cache des détails déjà chargés : { [id]: data } */
