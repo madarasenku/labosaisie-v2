@@ -72,25 +72,18 @@ function allerAuMois() {
 }
 
 function setHistPeriode(periode, garderDecalage) {
-  // Changer de granularité repart de la période en cours, sauf si l'appel
-  // vient de la navigation elle-même (flèches, sélecteurs).
-  if (!garderDecalage) _histDecalage = 0;
-  _histPeriode = periode;
-  ['jour','semaine','mois','tout'].forEach(p => {
-    const btn = document.getElementById('hist-btn-' + p);
-    if (btn) btn.classList.toggle('active', p === periode);
-  });
-
-  if (periode !== 'custom') {
-    const { from, to } = getHistRange();
-    const fromEl = document.getElementById('filter-date-from');
-    const toEl   = document.getElementById('filter-date-to');
-    if (fromEl) fromEl.value = from || '';
-    if (toEl)   toEl.value   = (periode === 'tout') ? '' : (to || '');
+  // ✅ v13.108 — La période est désormais commune aux trois vues. Le cas
+  // « custom » relit les champs de dates de l'Historique (ce sont EUX qui
+  // déclenchent cet appel via leur onchange) : sans cette relecture, la
+  // période « custom » les effacerait en boucle.
+  if (periode === 'custom') {
+    const from = document.getElementById('filter-date-from')?.value || '';
+    const to   = document.getElementById('filter-date-to')?.value   || '';
+    appliquerPeriodePartout('custom', 0, from, to);
+  } else {
+    const dec = garderDecalage ? _histDecalage : 0;
+    appliquerPeriodePartout(periode, dec);
   }
-
-  majNavPeriode();
-
   // ✅ v13.68 — le cache contient toutes les fiches : filtrage client instantané,
   // plus aucun aller-retour serveur au changement de période.
   renderHistory();
@@ -103,15 +96,8 @@ function appliquerFiltreCustom() {
   const from = document.getElementById('filter-date-from')?.value || '';
   const to   = document.getElementById('filter-date-to')?.value   || '';
   if (!from && !to) { toast('Saisissez au moins une date', 'err'); return; }
-  _histPeriode = 'custom';
-  _histDecalage = 0;
-  // ✅ v13.68 — filtrage client sur le cache complet : instantané, et le
-  // fallback « filtre date serveur inactif » n'a plus lieu d'être.
-  ['jour','semaine','mois','tout'].forEach(p => {
-    const btn = document.getElementById('hist-btn-' + p);
-    if (btn) btn.classList.remove('active');
-  });
-  majNavPeriode();
+  // ✅ v13.108 — La plage libre vaut, elle aussi, pour les trois vues.
+  appliquerPeriodePartout('custom', 0, from, to);
   renderHistory();
 }
 
@@ -331,7 +317,14 @@ async function renderHistory(forceRefresh) {
   // 607 500 FCFA, étaient devenus invisibles exactement de cette façon.
   const lockBtn = (r) => {
     if (_filterVerrouillees || _filterCorbeille) return ''; // géré par les rows spéciaux
-    if (!isAdmin()) return '';
+    if (typeof isSpectateur === 'function' && isSpectateur()) return '';
+    // ✅ v13.116 — L'admin masque n'importe quelle fiche ; un agent peut masquer
+    // (et démasquer) SES propres fiches. Un agent ne voit pas le bouton sur la
+    // fiche d'un autre, ni sur une fiche masquée par l'administrateur.
+    const uid = _currentUser?.username;
+    const owner = r.createdBy === uid;
+    const lockedByAdminOther = !!r.restrictedBy && r.restrictedBy !== uid;
+    if (!isAdmin() && (!owner || lockedByAdminOther)) return '';
     const locked = !!r.restrictedBy;
     const style = locked
       ? 'background:#fef3c7;color:#92400e;border:1px solid #fbbf24'
@@ -490,8 +483,12 @@ async function renderHistory(forceRefresh) {
                     : '';
                 })()
           )
-        + '<button class="btn btn-success" style="padding:4px 8px;font-size:11px;margin-left:3px" onclick="exportRecord(' + r.id + ')">⬇</button>'
-        + '<button class="btn" style="padding:4px 8px;font-size:11px;margin-left:3px;background:#dc2626;color:#fff" onclick="exportPDF(' + r.id + ')" title="Exporter en PDF" aria-label="Exporter en PDF">📄</button>'
+        // ✅ v13.158 — Sortie du compte rendu via le rendu HTML (printRecord) :
+        // modèle validé en nuances de gris, sans signature imprimée (apposée à la
+        // main à la sortie des résultats), seuls les résultats anormaux surlignés.
+        // Depuis la fenêtre d'impression, « Enregistrer au format PDF » donne le
+        // PDF. exportPDF/exportRecord restent définis pour un usage éventuel.
+        + '<button class="btn btn-success" style="padding:4px 8px;font-size:11px;margin-left:3px" onclick="printRecord(' + r.id + ')" title="Imprimer le compte rendu">🖨 Imprimer</button>'
         + ((isCaissier() || isSpectateur()) ? ''
             : '<button class="btn" style="padding:4px 8px;font-size:11px;margin-left:3px;background:#e0f2fe;color:#0369a1;border:1px solid #7dd3fc" onclick="dupliquerDossier(' + r.id + ')" title="Dupliquer ce patient">⎘</button>'
               + dossierMulti
@@ -506,7 +503,6 @@ async function renderHistory(forceRefresh) {
         // même titre que la duplication. Seul le spectateur en reste exclu, et
         // c'est softDeleteBtn qui le décide — un seul endroit qui tranche.
         + softDeleteBtn(r)
-        + '<button class="btn" style="padding:4px 8px;font-size:11px;margin-left:3px" onclick="printRecord(' + r.id + ')" title="Imprimer résultats" aria-label="Imprimer les résultats">🖨</button>'
         + '<button class="btn" style="padding:4px 8px;font-size:11px;margin-left:3px;background:#f0fdf4;color:#166534;border:1px solid #86efac" onclick="choisirSignataireRecu(' + r.id + ')" title="Imprimer le reçu">🧾</button>'
         + '<button class=\'btn btn-action-menu\' style=\'display:none;padding:4px 10px;font-size:15px;margin-left:3px;line-height:1\' onclick=\'toggleActionMenu(this)\' title=\'Actions\' aria-label=\'Actions\'>⋯</button>'
       + '</td></tr>';
@@ -628,13 +624,24 @@ function updateBulkToolbar() {
   const n = _selectedIds.size;
   if (toolbar) toolbar.style.display = n > 0 ? 'flex' : 'none';
   if (countEl) countEl.textContent = n + ' fiche' + (n > 1 ? 's' : '') + ' sélectionnée' + (n > 1 ? 's' : '');
-  if (delBtn) delBtn.style.display = isAdmin() ? '' : 'none';
-  // ✅ v13.82 — Verrouillage réservé à l'administrateur : on masque les boutons
-  // plutôt que de laisser cliquer pour refuser ensuite. Un bouton qui dit
-  // toujours non est plus agaçant qu'un bouton absent.
+  // ✅ v13.122 — Suppression en groupe ouverte à tous (hors spectateur), comme la
+  // suppression ligne par ligne : en vue normale c'est une mise en corbeille
+  // (réversible, tracée) ; la suppression DÉFINITIVE reste réservée à l'admin,
+  // et seulement depuis la corbeille.
+  if (delBtn) {
+    const spect = (typeof isSpectateur === 'function' && isSpectateur());
+    delBtn.style.display = (spect || (_filterCorbeille && !isAdmin())) ? 'none' : '';
+    delBtn.innerHTML = _filterCorbeille ? '🗑 Supprimer définitivement' : '🗑 Supprimer';
+  }
+  const peutMasquer = !(typeof isSpectateur === 'function' && isSpectateur());
+  // ✅ v13.125 — Réception seule : boutons visibles hors spectateur et hors corbeille.
+  ['bulk-recept-on', 'bulk-recept-off'].forEach(idBtn => {
+    const b = document.getElementById(idBtn);
+    if (b) b.style.display = (peutMasquer && !_filterCorbeille) ? '' : 'none';
+  });
   ['bulk-lock-btn', 'bulk-unlock-btn'].forEach(idBtn => {
     const b = document.getElementById(idBtn);
-    if (b) b.style.display = isAdmin() ? '' : 'none';
+    if (b) b.style.display = peutMasquer ? '' : 'none';
   });
   // État de la case "tout sélectionner"
   if (selectAll) {
@@ -666,6 +673,9 @@ function updateMasqueesBtn() {
   const count = isAdmin()
     ? _dbCache.filter(r => !r.deletedAt && !!r.restrictedBy).length
     : _dbCache.filter(r => !r.deletedAt && r.restrictedBy === uid).length;
+  // ✅ v13.105 — Aucun indice en session ordinaire. Le cadenas de la v13.104
+  // disait à qui regardait l'écran qu'il existait quelque chose derrière ;
+  // c'est précisément ce que la seconde porte évite.
   if (badge) badge.textContent = count;
   btn.style.display   = count > 0 ? 'flex' : 'none';
   btn.style.opacity   = _filterVerrouillees ? '1' : '0.75';
@@ -749,6 +759,7 @@ async function softDeleteDossier(id) {
 
   const { data, error } = await _sb.rpc('soft_delete_dossier', { p_token: TK(), p_id: id });
   if (error || data !== 'ok') {
+    if (typeof estJourVerrouille === 'function' && estJourVerrouille(error)) { toast('🔒 Journée verrouillée — suppression impossible', 'err'); return; }
     toast('Erreur : ' + (error?.message || data || 'inconnue'), 'err');
     return;
   }
@@ -1007,15 +1018,21 @@ async function bulkSetStatut(statut) {
 
 async function bulkLock() {
   if (blockIfSpectateur()) return;
-  // ✅ v13.82 — Verrouillage réservé à l'administrateur.
-  if (!isAdmin()) { toast('Le verrouillage est réservé à l\'administrateur', 'err'); return; }
+  const uid = _currentUser?.username;
   const ids = [..._selectedIds];
   if (!ids.length) return;
+  // ✅ v13.116 — Un agent ne masque QUE ses propres fiches ; l'admin masque tout.
+  let ignoreesAutrui = 0;
   const eligible = ids.filter(id => {
     const r = _dbCache.find(x => x.id === id);
-    return r && !r.restrictedBy;
+    if (!r || r.restrictedBy) return false;
+    if (!isAdmin() && r.createdBy !== uid) { ignoreesAutrui++; return false; }
+    return true;
   });
-  if (!eligible.length) { toast('Aucune fiche éligible au verrouillage', 'err'); return; }
+  if (!eligible.length) {
+    toast(ignoreesAutrui ? 'Vous ne pouvez masquer que vos propres fiches' : 'Aucune fiche éligible au masquage', 'err');
+    return;
+  }
   if (!await showConfirmModal({
     icon: '🔒',
     title: 'Masquer ' + eligible.length + ' fiche(s) ?',
@@ -1035,20 +1052,28 @@ async function bulkLock() {
   hideLoading();
   clearBulkSelection();
   renderHistory();
-  toast(ok + ' fiche(s) verrouillée(s)' + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
+  toast(ok + ' fiche(s) masquée(s)'
+    + (ignoreesAutrui ? ' · ' + ignoreesAutrui + ' ignorée(s) (autre agent)' : '')
+    + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
 }
 
 async function bulkUnlock() {
   if (blockIfSpectateur()) return;
-  // ✅ v13.82 — Déverrouillage réservé à l'administrateur, comme le verrouillage.
-  if (!isAdmin()) { toast('Le déverrouillage est réservé à l\'administrateur', 'err'); return; }
+  const uid = _currentUser?.username;
   const ids = [..._selectedIds];
   if (!ids.length) return;
+  // ✅ v13.116 — Un agent ne lève QUE ses propres restrictions ; l'admin lève tout.
+  let ignoreesAutrui = 0;
   const eligible = ids.filter(id => {
     const r = _dbCache.find(x => x.id === id);
-    return r && r.restrictedBy;
+    if (!r || !r.restrictedBy) return false;
+    if (!isAdmin() && r.restrictedBy !== uid) { ignoreesAutrui++; return false; }
+    return true;
   });
-  if (!eligible.length) { toast('Aucune fiche verrouillée dans la sélection', 'err'); return; }
+  if (!eligible.length) {
+    toast(ignoreesAutrui ? 'Vous ne pouvez démasquer que vos propres fiches' : 'Aucune fiche masquée dans la sélection', 'err');
+    return;
+  }
   if (!await showConfirmModal({
     icon: '🔓',
     title: 'Lever la restriction ?',
@@ -1068,38 +1093,107 @@ async function bulkUnlock() {
   hideLoading();
   clearBulkSelection();
   renderHistory();
-  toast(ok + ' fiche(s) déverrouillée(s)' + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
+  toast(ok + ' fiche(s) démasquée(s)'
+    + (ignoreesAutrui ? ' · ' + ignoreesAutrui + ' ignorée(s) (autre agent)' : '')
+    + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
 }
 
 async function bulkDelete() {
   if (blockIfSpectateur()) return;
-  if (!isAdmin()) { toast('Action réservée aux administrateurs', 'err'); return; }
   const ids = [..._selectedIds];
   if (!ids.length) return;
+
+  // ✅ v13.122 — En vue CORBEILLE : suppression DÉFINITIVE (admin uniquement).
+  if (_filterCorbeille) {
+    if (!isAdmin()) { toast('Suppression définitive réservée à l\'administrateur', 'err'); return; }
+    if (!await showConfirmModal({
+      icon: '⚠️', title: 'Supprimer définitivement ?',
+      message: ids.length + ' fiche(s) seront supprimée(s) de façon irréversible.',
+      confirmText: 'Supprimer définitivement', cancelText: 'Annuler', confirmClass: 'btn-danger'
+    })) return;
+    showLoading('Suppression définitive…');
+    let ok = 0, err = 0;
+    for (const id of ids) { const s = await deleteRecordRemote(id); if (s) ok++; else err++; }
+    hideLoading(); clearBulkSelection(); await refreshDB(true); renderHistory();
+    toast(ok + ' fiche(s) supprimée(s) définitivement' + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
+    return;
+  }
+
+  // ── Vue normale : mise en CORBEILLE (réversible), ouverte à tous ──
+  const uid = _currentUser?.username;
   if (!await showConfirmModal({
-    icon: '⚠️',
-    title: 'Supprimer définitivement ?',
-    message: ids.length + ' fiche(s) seront supprimée(s) de façon irréversible.',
+    icon: '🗑️', title: 'Supprimer ' + ids.length + ' fiche(s) ?',
+    message: 'Elles seront placées dans la corbeille (l\'administrateur peut les restaurer). '
+      + 'Votre nom est enregistré dans le journal d\'audit.',
     confirmText: 'Supprimer', cancelText: 'Annuler', confirmClass: 'btn-danger'
   })) return;
-  showLoading('Suppression en cours…');
+  showLoading('Mise en corbeille…');
   let ok = 0, err = 0;
   for (const id of ids) {
-    const success = await deleteRecordRemote(id);
-    if (success) ok++; else err++;
+    try {
+      if (!navigator.onLine || String(id).startsWith('tmp_')) {
+        const rec = _dbCache.find(r => r.id === id);
+        if (rec) { rec.deletedAt = new Date().toISOString(); rec.deletedBy = uid; }
+        enqueueAction('soft_delete_dossier', id); ok++;
+        continue;
+      }
+      const { data, error } = await _sb.rpc('soft_delete_dossier', { p_token: TK(), p_id: id });
+      if (!error && data === 'ok') {
+        const rec = _dbCache.find(r => r.id === id);
+        if (rec) { rec.deletedAt = new Date().toISOString(); rec.deletedBy = uid; }
+        ok++;
+      } else err++;
+    } catch (e) { err++; }
   }
   hideLoading();
   clearBulkSelection();
   await refreshDB(true);
+  if (typeof updateCorbeilleBtn === 'function') updateCorbeilleBtn();
+  if (typeof updateHistoriqueBadge === 'function') updateHistoriqueBadge();
   renderHistory();
-  toast(ok + ' fiche(s) supprimée(s)' + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
+  toast(ok + ' fiche(s) mise(s) en corbeille' + (err ? ' · ' + err + ' erreur(s)' : ''), err ? 'err' : 'ok');
 }
 
 // ✅ v13.42 — Encaissement groupé : marque tous les dossiers sélectionnés
 //   comme payés au montant exact demandé (montant reçu = montant, pas de
 //   monnaie). Chaque dossier est persisté dans Supabase individuellement.
+// ✅ v13.125 — Marquer/retirer « réception seule » (exclusion de la saisie en
+// série) sur les dossiers sélectionnés.
+async function bulkReceptionSeule(value) {
+  if (blockIfSpectateur()) return;
+  const ids = [..._selectedIds];
+  if (!ids.length) return;
+  showLoading(value ? 'Exclusion de la série…' : 'Réintégration…');
+  try {
+    const { data, error } = await _sb.rpc('set_reception_seule', { p_token: TK(), p_ids: ids, p_value: !!value });
+    hideLoading();
+    if (error || (data && data.erreur)) {
+      toast('Échec : ' + (error?.message || data?.erreur || 'inconnue'), 'err');
+      return;
+    }
+    const n = (data && data.modifies) || 0;
+    // Mise à jour optimiste du cache pour un effet immédiat côté grille.
+    ids.forEach(id => {
+      const r = _dbCache.find(x => x.id === id);
+      if (r) { r.resultats = r.resultats || {}; r.resultats._reception_seule = !!value; }
+    });
+    clearBulkSelection();
+    await refreshDB(true);
+    renderHistory();
+    toast((value ? '📥 ' : '↩ ') + n + ' dossier(s) ' + (value ? 'exclu(s) de la saisie en série' : 'remis en saisie en série'), 'ok');
+  } catch (e) {
+    hideLoading();
+    toast('Erreur : ' + (e.message || e), 'err');
+  }
+}
+
 async function bulkEncaisser() {
   if (blockIfSpectateur()) return;
+  // ✅ v13.122 — Encaissement réservé à la caisse (admin/caissier), ou aux agents
+  // s'il n'existe aucun caissier.
+  if (typeof peutEncaisser === 'function' && !peutEncaisser()) {
+    toast('Encaissement réservé à la caisse', 'err'); return;
+  }
   const ids = [..._selectedIds];
   if (!ids.length) return;
 
@@ -1135,6 +1229,7 @@ async function bulkEncaisser() {
     const { data, error } = await _sb.rpc('encaisser_lot', { p_token: TK(), p_ids: eligible });
     hideLoading();
     if (error || !data || data.erreur) {
+      if (typeof estJourVerrouille === 'function' && estJourVerrouille(error)) { toast('🔒 Journée verrouillée — encaissement impossible', 'err'); return; }
       toast('Encaissement échoué : ' + (error?.message || data?.erreur || '?'), 'err');
       return;
     }
@@ -1223,13 +1318,18 @@ function showEditUnifie(id) {
   bd.id = 'edit-unifie-modal';
   bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:3000;display:flex;align-items:center;justify-content:center;padding:20px';
 
-  const typesChoix = types.length > 1
-    ? types.map(t => `<button class="btn" onclick="document.getElementById('edit-unifie-modal').remove();editRecord(${id},'${t}')"
+  // ✅ v13.113 — UN SEUL bouton « Compléter les résultats » : ouvre TOUTES les
+  //   analyses cochées sur une seule page (editRecord sans type → fillAllResults).
+  //   Avant, un dossier multi-analyses affichait un bouton PAR analyse (avec type
+  //   forcé), ce qui rouvrait une seule analyse à la fois — d'où « tous les champs
+  //   ne viennent pas sur la même page ».
+  const _libAnalyses = (types.length ? types.join('  ·  ') : 'Analyse');
+  // ✅ v13.141 — Ouvre directement la fiche complète (toutes les analyses sur
+  //   une page). La paillasse a été supprimée.
+  const _openFn = (typeof fillAllResults === 'function') ? `fillAllResults(${id})` : `editRecord(${id})`;
+  const typesChoix = `<button class="btn" onclick="document.getElementById('edit-unifie-modal').remove();${_openFn}"
         style="width:100%;padding:11px 14px;text-align:left;margin-bottom:6px;background:var(--surface-1);border:1px solid var(--border);border-radius:8px;font-size:13px;cursor:pointer">
-        ✏️ Modifier les résultats — <strong>${esc(t)}</strong></button>`).join('')
-    : `<button class="btn" onclick="document.getElementById('edit-unifie-modal').remove();editRecord(${id})"
-        style="width:100%;padding:11px 14px;text-align:left;margin-bottom:6px;background:var(--surface-1);border:1px solid var(--border);border-radius:8px;font-size:13px;cursor:pointer">
-        ✏️ Modifier les résultats — <strong>${esc(types[0] || 'Analyse')}</strong></button>`;
+        🧫 Compléter / modifier — <strong>${esc(_libAnalyses)}</strong></button>`;
 
   bd.innerHTML = `
     <div style="background:var(--surface-2);border-radius:16px;padding:24px 26px;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.25)">
@@ -1305,6 +1405,13 @@ async function saveThenNext(type) {
 
 // ✅ v13.35 — Enregistrer tous les onglets cochés en séquence automatique
 async function saveAllTabs() {
+  // ✅ v13.112 — En édition d'un dossier (mode « remplir tout sur une page »),
+  // déléguer à l'enregistrement atomique : une boucle sur _saveRecordImpl
+  // remettrait _editingRecordId à null dès la 1ʳᵉ analyse et créerait des doublons.
+  if ((typeof _fillAllMode !== 'undefined' && _fillAllMode) ||
+      (typeof _editingRecordId !== 'undefined' && _editingRecordId)) {
+    return saveRecordAll();
+  }
   const tabsACochecher = TAB_ORDER.filter(tabId => {
     const cat = getCatalogueComplet().filter(ex => ex.tab === tabId);
     return cat.some(ex => document.getElementById(ex.id)?.checked);
@@ -1362,6 +1469,7 @@ function adminShowSub(id, btn) {
   if (id === 'ac-sauvegarde') {
     if (typeof majBandeauSauvegarde === 'function') majBandeauSauvegarde();
     if (typeof chargerInstantanes   === 'function') chargerInstantanes();
+    if (typeof majPanneauCoffre     === 'function') majPanneauCoffre();
   }
 }
 
