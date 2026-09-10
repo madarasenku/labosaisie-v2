@@ -31,8 +31,8 @@
    checkForUpdate() dans index.html).
    ============================================================ */
 
-const APP_VERSION = '13.102';
-const CACHE = 'cpmi-labo-V2-v77';
+const APP_VERSION = '13.161';
+const CACHE = 'cpmi-labo-v135';
 const v = url => url + '?v=' + APP_VERSION;
 
 /* Pré-cacher les fichiers essentiels à l'installation.
@@ -55,13 +55,17 @@ const PRECACHE = [
   v('./js/export-excel.js'),
   v('./js/prescripteurs.js'),
   v('./js/saisie.js'),
+  v('./js/completude.js'),
+  v('./js/grille.js'),
   v('./js/ui-auth.js'),
   v('./js/session-pwa.js'),
   v('./js/stats.js'),
+  v('./js/compte-rendu.js'),
   v('./js/impression.js'),
   v('./js/export-pdf.js'),
   v('./js/sauvegarde.js'),
   v('./js/cloture-caisse.js'),
+  v('./js/coffre.js'),
   v('./js/cahier-jaune.js'),
   v('./vendor/exceljs-4.4.0.min.js'),
   v('./vendor/chart-4.4.1.umd.js'),
@@ -118,6 +122,22 @@ self.addEventListener('fetch', e => {
         }
         return res;
       })
-      .catch(() => caches.match(e.request, { ignoreSearch: true }))
+      /* ✅ v13.138 — CORRECTIF « HTML neuf + JS périmé ».
+         L'ancien repli utilisait ignoreSearch:true : une requête
+         js/grille.js?v=13.138 pouvait être servie par un js/grille.js?v=13.114
+         resté en cache. Sur une connexion instable, l'app tournait donc avec
+         un index.html à jour et des modules d'une version antérieure —
+         symptômes : rien ne s'enregistre, impression vide, examens qui
+         disparaissent. On exige désormais une correspondance EXACTE pour tout
+         actif versionné ; le repli « toutes versions » ne sert plus qu'aux
+         ressources sans ?v= (pages HTML). */
+      .catch(async () => {
+        const exact = await caches.match(e.request);
+        if (exact) return exact;
+        let versionne = false;
+        try { versionne = new URL(e.request.url).searchParams.has('v'); } catch (err) {}
+        if (versionne) return Response.error();
+        return (await caches.match(e.request, { ignoreSearch: true })) || Response.error();
+      })
   );
 });
