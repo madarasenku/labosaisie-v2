@@ -19,8 +19,11 @@ function showView(v) {
 
   // ✅ v13.33 — Déterminer quel conteneur caisse afficher
   // Admin et Caissier → caisse complète ; Agent → vue personnelle simplifiée
-  const caisseAdminVisible  = (v === 'caisse' && (isAdmin() || isCaissier()));
-  const caisseUserVisible   = (v === 'caisse' && !isAdmin() && !isCaissier());
+  // ✅ v13.122 — S'il n'y a pas de caissier, l'agent obtient la caisse COMPLÈTE
+  // (il tient la caisse lui-même) via peutEncaisser().
+  const caisseComplet = isAdmin() || isCaissier() || (typeof peutEncaisser === 'function' && peutEncaisser());
+  const caisseAdminVisible  = (v === 'caisse' && caisseComplet);
+  const caisseUserVisible   = (v === 'caisse' && !caisseComplet);
 
   const allViews = [
     { id: 'view-saisie',       show: v === 'saisie' },
@@ -64,6 +67,14 @@ function showView(v) {
   if (v === 'stats') renderStats();
   if (v === 'caisse') renderCaisse();
   if (v === 'cahier' && typeof chargerCahierJaune === 'function') chargerCahierJaune();
+
+  // ✅ v13.109 — Mémoriser l'onglet courant pour y revenir après un
+  // rechargement, au lieu de toujours retomber sur « Nouveau patient ».
+  // On ne retient QUE les vues de travail : ni les Comptes (réglages admin),
+  // ni surtout le Cahier jaune — le restaurer révélerait la seconde porte.
+  if (['saisie','historique','stats','caisse'].includes(v)) {
+    try { localStorage.setItem('labo_vue_courante', v); } catch (e) {}
+  }
 }
 
 /* ════════════════════════════════════════════════
@@ -250,6 +261,10 @@ function ensurePanelBuilt(name) {
 }
 
 function switchTab(name) {
+  // ✅ v13.112 — En mode « remplir tout sur une page », les onglets sont masqués
+  // et toutes les analyses cochées sont empilées : on ignore tout changement
+  // d'onglet qui réduirait la vue à un seul panneau.
+  if (typeof _fillAllMode !== 'undefined' && _fillAllMode) return;
   // ✅ v13.34 — Bloquer l'onglet si aucun examen de ce type n'est payé/coché
   // UNIQUEMENT quand on est en mode saisie de résultats (zone-saisie visible
   // ET fiche-identification masquée) — pas quand on coche depuis la fiche d'accueil
