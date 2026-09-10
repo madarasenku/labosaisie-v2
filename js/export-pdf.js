@@ -8,8 +8,9 @@
 
 async function exportPDF(id) {
   try {
-    const record = getDB().find(x => x.id === id);
+    const record = (typeof recordForOutput === 'function' ? recordForOutput(id) : getDB().find(x => x.id === id)); // ✅ v13.150 — fiches masquées incluses
     if (!record) { toast('Fiche introuvable', 'err'); return; }
+  if (typeof sortieAutorisee === 'function' && !sortieAutorisee(id)) return;
     await ensureFull(record); // ✅ v13.5 — détail complet avant export PDF
 
     if (isDossierRecord(record)) {
@@ -30,9 +31,13 @@ async function exportPDF(id) {
 // Export Excel d'une fiche depuis l'historique (par id) — c'était la fonction
 // manquante qui empêchait le bouton ⬇ Excel de la table Historique de fonctionner.
 async function exportRecord(id) {
-  const record = getDB().find(x => x.id === id);
+  // ✅ v13.150 — recordForOutput : retrouve aussi les fiches masquées (impression
+  // autorisée depuis une fiche masquée pour l'admin/créateur).
+  const record = (typeof recordForOutput === 'function' ? recordForOutput(id) : getDB().find(x => x.id === id));
   if (!record) { toast('Fiche introuvable', 'err'); return; }
+  if (typeof sortieAutorisee === 'function' && !sortieAutorisee(id)) return;
   if (!ensureExcelJSReady()) return;
+  await ensureFull(record); // ✅ v13.148 — charger le détail (sinon Excel vide : tout « à compléter »)
 
   const wb = new ExcelJS.Workbook();
   wb.creator = CENTRE;
@@ -40,7 +45,32 @@ async function exportRecord(id) {
 
   const usedNamesR = new Set();
   try {
-    if (isDossierRecord(record)) {
+    if (isDossierRecord(record) && typeof estBPN === 'function' && estBPN(record)) {
+      // ✅ v13.148 — BILAN PRÉNATAL : deux feuilles seulement.
+      //   Feuille 1 = Hématologie + Groupe sanguin ; Feuille 2 = Biochimie +
+      //   Immuno-Sérologies. Forfait affiché à 20 000 FCFA (le montant réel en
+      //   caisse n'est pas modifié). Widal masqué, électrophorèse = profil en grand.
+      const resDe = t => getRecordResultats(record, t);
+      const pendingDe = types => types.reduce((a, t) => {
+        try { return a.concat(getPendingCheckedExams(record, t)); } catch (e) { return a; }
+      }, []);
+      const FORFAIT = 20000;
+      buildProfessionalSheet(wb, { ...record, type: 'Dossier' },
+        safeSheetName('Hématologie + Groupe', usedNamesR), {
+          bpn: true, montant: FORFAIT,
+          render: [{ type: 'Hématologie', res: resDe('Hématologie') },
+                   { type: 'Groupe sanguin', res: resDe('Groupe sanguin') }],
+          pending: pendingDe(['Hématologie', 'Groupe sanguin']),
+          composition: record.resultats && record.resultats['_bpn_inclus'],
+        });
+      buildProfessionalSheet(wb, { ...record, type: 'Dossier' },
+        safeSheetName('Biochimie + Sérologies', usedNamesR), {
+          bpn: true, montant: FORFAIT,
+          render: [{ type: 'Biochimie', res: resDe('Biochimie') },
+                   { type: 'Immuno-Sérologie', res: resDe('Immuno-Sérologie') }],
+          pending: pendingDe(['Biochimie', 'Immuno-Sérologie']),
+        });
+    } else if (isDossierRecord(record)) {
       const types = getRecordTypes(record);
       if (!types.length) { toast('Aucune analyse dans ce dossier', 'err'); return; }
       types.forEach(type => {
@@ -85,7 +115,10 @@ async function exportRecord(id) {
     addR('Service', p.service);
     addR('Médecin', p.medecin);
     addR('Analyses', getRecordTypes(record).join(', '));
-    addR('Montant total', record.montant ? record.montant.toLocaleString('fr-FR') + ' FCFA' : '—', true);
+    // ✅ v13.148 — Le forfait prénatal s'affiche à 20 000 FCFA (affichage CR/récap
+    // uniquement ; le montant réel en caisse/historique n'est pas modifié).
+    const _montantRecap = (typeof estBPN === 'function' && estBPN(record)) ? 20000 : record.montant;
+    addR('Montant total', _montantRecap ? _montantRecap.toLocaleString('fr-FR') + ' FCFA' : '—', true);
     addR('Saisi par', record.createdBy);
     addR('Date enregistrement', record.savedAt ? new Date(record.savedAt).toLocaleString('fr-FR') : '');
     // Déplacer la feuille récap en premier
@@ -305,36 +338,40 @@ async function buildPDF(r, analyses) {
   // ── Tableau des résultats ─────────────────────────────────
   const rows = [];
 
+  // ✅ v13.150 — Helpers PARTAGÉS par toutes les branches (Hématologie ET le bloc
+  // « else » : Biochimie, Immuno-Sérologie, Groupe…). Ils étaient définis dans le
+  // seul bloc Hématologie → ReferenceError « sectionTitle is not defined » à
+  // l'export PDF d'un dossier contenant biochimie/sérologie (ex. bilan prénatal).
+  const addTable = (head, body, opts={}) => {
+    if (!body.length) return;
+    const o2 = { ...opts }; delete o2.interpCol;
+    doc.autoTable({
+      startY: y, head: [head], body,
+      margin: { left: MARGIN, right: MARGIN },
+      styles: { fontSize: 8, cellPadding: 2 /* ✅ v13.34 */ },
+      headStyles: { fillColor: [30,58,138], textColor: 255, fontStyle: 'bold', fontSize: 8 },
+      alternateRowStyles: { fillColor: [250,251,253] },
+      ...o2,
+      // ✅ v13.18 — colorer la cellule Valeur (col 1) selon l'interprétation
+      // stockée en dernière colonne (même logique qu'Excel, sans afficher l'interp)
+      didParseCell: (data) => {
+        if (data.section !== 'body' || data.column.index !== 1) return;
+        const rowData = data.row.raw;
+        const interp = String(rowData[rowData.length - 1] || '').toLowerCase();
+        if (interp.includes('élevé')||interp.includes('eleve'))       { data.cell.styles.textColor=[153,27,27];  data.cell.styles.fillColor=[253,232,232]; }
+        else if (interp.includes('bas'))                               { data.cell.styles.textColor=[30,64,175];  data.cell.styles.fillColor=[232,240,254]; }
+        else if (interp.includes('normal'))                            { data.cell.styles.textColor=[21,128,61];  data.cell.styles.fillColor=[232,248,238]; }
+      }
+    });
+    y = doc.lastAutoTable.finalY + 3; // ✅ v13.34
+  };
+
+  const sectionTitle = (txt) => {
+    doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(30,58,138);
+    doc.text(txt, MARGIN, y); y += 3.5; // ✅ v13.34
+  };
+
   if (rType === 'Hématologie') {
-
-    const addTable = (head, body, opts={}) => {
-      if (!body.length) return;
-      const o2 = { ...opts }; delete o2.interpCol;
-      doc.autoTable({
-        startY: y, head: [head], body,
-        margin: { left: MARGIN, right: MARGIN },
-        styles: { fontSize: 8, cellPadding: 2 /* ✅ v13.34 */ },
-        headStyles: { fillColor: [30,58,138], textColor: 255, fontStyle: 'bold', fontSize: 8 },
-        alternateRowStyles: { fillColor: [250,251,253] },
-        ...o2,
-        // ✅ v13.18 — colorer la cellule Valeur (col 1) selon l'interprétation
-        // stockée en dernière colonne (même logique qu'Excel, sans afficher l'interp)
-        didParseCell: (data) => {
-          if (data.section !== 'body' || data.column.index !== 1) return;
-          const rowData = data.row.raw;
-          const interp = String(rowData[rowData.length - 1] || '').toLowerCase();
-          if (interp.includes('élevé')||interp.includes('eleve'))       { data.cell.styles.textColor=[153,27,27];  data.cell.styles.fillColor=[253,232,232]; }
-          else if (interp.includes('bas'))                               { data.cell.styles.textColor=[30,64,175];  data.cell.styles.fillColor=[232,240,254]; }
-          else if (interp.includes('normal'))                            { data.cell.styles.textColor=[21,128,61];  data.cell.styles.fillColor=[232,248,238]; }
-        }
-      });
-      y = doc.lastAutoTable.finalY + 3; // ✅ v13.34
-    };
-
-    const sectionTitle = (txt) => {
-      doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(30,58,138);
-      doc.text(txt, MARGIN, y); y += 3.5; // ✅ v13.34
-    };
 
     // ── NFS ─────────────────────────────────────────────────────
     const nfsRows = [];
@@ -543,6 +580,11 @@ async function buildPDF(r, analyses) {
   }
 
   // ── Pied de page ─────────────────────────────────────────
+  // ✅ v13.156 — Ancrer le bloc bas (Édité + Commentaire/Signature/QR) EN BAS de
+  //   la page A4, comme le modèle : contenu compact en haut, signature en bas.
+  //   Si le contenu descend déjà plus bas, on garde la position naturelle.
+  const _footerFloor = 242; // mm : le liséré part d'ici au minimum
+  if (y < _footerFloor) y = _footerFloor;
   // Liseré doré
   doc.setFillColor(203, 161, 53);
   doc.rect(MARGIN, y, W - 2*MARGIN, 0.8, 'F');
@@ -556,13 +598,27 @@ async function buildPDF(r, analyses) {
   const _refDoc = getOrCreateRef(r);
   const _techName = (typeof _currentUser !== 'undefined' && _currentUser?.username) ? _currentUser.username.toUpperCase() : '—';
   doc.text('Édité le ' + now.toLocaleDateString('fr-FR') + ' à ' + now.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}) + '  ·  CPMI DE GRAND-BASSAM  ·  Réf. ' + _refDoc, MARGIN, y);
+  // ✅ v13.156 — Montant en gras sur sa propre ligne (comme le modèle Excel).
+  //   Forfait BPN = 20 000 (affichage CR seulement). Espace fine remplacée par
+  //   une espace normale (l'espace insécable fine sort mal en PDF Helvetica).
+  const _montPdf = (typeof estBPN === 'function' && estBPN(r)) ? 20000 : r.montant;
+  if (_montPdf) {
+    y += 4.5;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.setTextColor(30, 58, 138);
+    doc.text('Montant : ' + _montPdf.toLocaleString('fr-FR').replace(/ | /g, ' ') + ' FCFA', MARGIN, y);
+  }
   y += 6;
 
-  // ✅ v13.34 — Zone commentaire + signature technicien (médecin supprimé)
+  // ✅ v13.156 — Bas de page en TROIS zones DISTINCTES (comme le modèle) :
+  //   Commentaire (gauche) · Signature (centre) · QR (droite), sans chevauchement.
+  //   Avant, les deux QR étaient posés PAR-DESSUS la case signature → illisible.
   const zoneW = (W - 2*MARGIN);
-  const commentW = zoneW * 0.6;
-  const sigW = zoneW * 0.38;
-  const sigX = MARGIN + commentW + zoneW * 0.02;
+  const commentW = zoneW * 0.50;
+  const sigW     = zoneW * 0.30;
+  const sigX     = MARGIN + commentW + zoneW * 0.02;
+  const qrColW   = zoneW * 0.16;
+  const qrColX   = sigX + sigW + zoneW * 0.02;
+  const BOXH = 22;
 
   // Zone commentaire technicien
   doc.setFillColor(220, 232, 251);
@@ -570,19 +626,17 @@ async function buildPDF(r, analyses) {
   doc.setTextColor(30,58,138); doc.setFont('helvetica','bold'); doc.setFontSize(8);
   doc.text('Commentaire du technicien', MARGIN + 2, y + 3.5);
   doc.setDrawColor(30,58,138); doc.setLineWidth(0.4);
-  doc.rect(MARGIN, y + 5, commentW, 16);
-  // Lignes de saisie
+  doc.rect(MARGIN, y + 5, commentW, BOXH);
   doc.setDrawColor(200,210,230); doc.setLineWidth(0.2);
-  for (let li = 1; li <= 3; li++) doc.line(MARGIN+2, y+5+li*4, MARGIN+commentW-2, y+5+li*4);
+  for (let li = 1; li <= 4; li++) doc.line(MARGIN+2, y+5+li*4.2, MARGIN+commentW-2, y+5+li*4.2);
 
-  // ✅ v13.35 — Zone signature PDF avec cursive SVG
+  // Zone signature (cursive SVG)
   doc.setFillColor(220, 232, 251);
   doc.rect(sigX, y, sigW, 5, 'F');
   doc.setTextColor(30,58,138); doc.setFont('helvetica','bold'); doc.setFontSize(8);
   doc.text('Signature du technicien', sigX + 2, y + 3.5);
   doc.setDrawColor(30,58,138); doc.setLineWidth(0.4);
-  doc.rect(sigX, y + 5, sigW, 22);
-  // Signature SVG → PNG via canvas → addImage
+  doc.rect(sigX, y + 5, sigW, BOXH);
   try {
     const _svgStr = generateSignatureSVG(_techName, 140, 40);
     if (_svgStr) {
@@ -596,7 +650,7 @@ async function buildPDF(r, analyses) {
           const _ctx = _cv.getContext('2d');
           _ctx.drawImage(_img, 0, 0, 280, 80);
           URL.revokeObjectURL(_url);
-          try { doc.addImage(_cv.toDataURL('image/png'), 'PNG', sigX + 1, y + 6, sigW - 2, 14); } catch(e){}
+          try { doc.addImage(_cv.toDataURL('image/png'), 'PNG', sigX + 1, y + 6, sigW - 2, 12); } catch(e){}
           res();
         };
         _img.onerror = res;
@@ -604,43 +658,28 @@ async function buildPDF(r, analyses) {
       });
     }
   } catch(_se) {}
-  // Nom et titre sous la signature
   doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(30,58,138);
-  doc.text(_techName, sigX + 2, y + 22);
-  doc.setFont('helvetica','italic'); doc.setFontSize(6.5); doc.setTextColor(120);
-  doc.text('Technicien de laboratoire · CPMI Grand-Bassam', sigX + 2, y + 25.5);
+  doc.text(_techName, sigX + 2, y + 5 + BOXH - 5);
+  doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(120);
+  doc.text('Technicien de laboratoire', sigX + 2, y + 5 + BOXH - 1.5);
 
-  // ✅ v13.35 — Double QR dans le PDF
+  // Zone QR (UNE seule, à droite, dans sa propre colonne)
   try {
     const _shareToken = r?.patient?.share_token;
-    const _qrContent1 = _shareToken
+    const _qrContent = _shareToken
       ? (APP_PUBLIC_URL + '?share=' + _shareToken)
-      : ('CPMI GRAND-BASSAM | REF: ' + _refDoc + ' | DOSSIER: ' + (p?.dossier||'—') + ' | PATIENT: ' + (p?.nom||'').toUpperCase());
-    const _qrContent2 = 'CPMI GRAND-BASSAM\nREF: ' + _refDoc + '\nDOSSIER: ' + (p?.dossier||'—') + '\nPATIENT: ' + (p?.nom||'').toUpperCase() + '\nANALYSE: ' + getDisplayType(r) + '\nDATE: ' + (p?.date ? new Date(p.date).toLocaleDateString('fr-FR') : '—');
-
-    const [_qrUrl1, _qrUrl2] = await Promise.all([
-      generateQRDataURL(_qrContent1, 80),
-      generateQRDataURL(_qrContent2, 80),
-    ]);
-
-    const qrSize = 18; // mm dans le PDF
-    const qrY = y + 1;
-    const qrX1 = W - MARGIN - qrSize * 2 - 4;
-    const qrX2 = W - MARGIN - qrSize;
-
-    if (_qrUrl1) {
-      doc.addImage(_qrUrl1, 'PNG', qrX1, qrY, qrSize, qrSize);
-      doc.setFont('helvetica','normal'); doc.setFontSize(5.5); doc.setTextColor(30,58,138);
-      doc.text(_shareToken ? 'Vérifier en ligne' : 'Info dossier', qrX1 + qrSize/2, qrY + qrSize + 2.5, { align: 'center' });
-    }
-    if (_qrUrl2) {
-      doc.addImage(_qrUrl2, 'PNG', qrX2 + 2, qrY, qrSize, qrSize);
+      : ('CPMI GRAND-BASSAM | REF: ' + _refDoc + ' | DOSSIER: ' + (p?.dossier||'—') + ' | PATIENT: ' + (p?.nom||'').toUpperCase()
+         + ' | ANALYSE: ' + getDisplayType(r) + ' | DATE: ' + (p?.date ? new Date(p.date).toLocaleDateString('fr-FR') : '—'));
+    const _qrUrl = await generateQRDataURL(_qrContent, 96);
+    const qrSize = Math.min(qrColW, 20);
+    const qrX = qrColX + (qrColW - qrSize) / 2;
+    if (_qrUrl) {
+      doc.addImage(_qrUrl, 'PNG', qrX, y + 2, qrSize, qrSize);
       doc.setFont('helvetica','normal'); doc.setFontSize(5.5); doc.setTextColor(100,116,139);
-      doc.text('Infos patient', qrX2 + 2 + qrSize/2, qrY + qrSize + 2.5, { align: 'center' });
+      doc.text(_shareToken ? 'Vérifier en ligne' : 'Info dossier', qrColX + qrColW/2, y + 2 + qrSize + 2.2, { align: 'center' });
+      doc.setFont('helvetica','bold'); doc.setFontSize(5.5); doc.setTextColor(30,58,138);
+      doc.text('Réf. ' + _refDoc, qrColX + qrColW/2, y + 2 + qrSize + 5, { align: 'center' });
     }
-    // Réf sous les QR
-    doc.setFont('helvetica','bold'); doc.setFontSize(5.5); doc.setTextColor(30,58,138);
-    doc.text('Réf. ' + _refDoc, qrX1 + qrSize + 2, qrY + qrSize + 6, { align: 'center' });
   } catch(_qrErr) { /* QR optionnel — ne bloque pas le PDF */ }
 
   // ✅ v13.35 — Pied de page conformité
@@ -673,8 +712,8 @@ async function buildPDF(r, analyses) {
 // ──────────────────────────────────────────────────────────────
 // TARIFICATION — Architecture claire :
 //
-//  localStorage 'v2_tarifs_ref'  = prix de RÉFÉRENCE (gérés par admin dans Comptes)
-//  localStorage 'v2_examens_custom' = examens ajoutés par l'admin
+//  localStorage 'tarifs_ref'  = prix de RÉFÉRENCE (gérés par admin dans Comptes)
+//  localStorage 'examens_custom' = examens ajoutés par l'admin
 //  px_{id} sur la fiche       = prix SESSION (modifiable par agent, réinitialisé
 //                               au Nouveau patient via rechargeFichePrix())
 //
