@@ -24,15 +24,23 @@ const TRANCHES = {
 };
 
 function getPatientProfile() {
-  const ageRaw = parseFloat(document.getElementById('p_age')?.value || '0');
+  const ageRaw = parseFloat(document.getElementById('p_age')?.value);
   const sexe = document.getElementById('p_sexe')?.value || '';
-  const age = isNaN(ageRaw) ? 0 : ageRaw;
+  // ✅ v13.154 — Âge NON saisi (vide/non numérique) = INCONNU → profil ADULTE
+  // (défaut raisonnable), et surtout PAS « nouveau-né ». Auparavant l'âge vide
+  // devenait 0, classé « NN » (GB 9–30) : un GB adulte normal (ex. 8) était alors
+  // interprété « Bas » et surligné à tort, et cette interprétation fausse était
+  // stockée puis réimprimée. Aligne getPatientProfile sur profileFromPatient.
+  const known = !isNaN(ageRaw);
+  const age = known ? ageRaw : 0;
   let tranche = 'ADULTE';
-  if (age < 0.08) tranche = 'NN';
-  else if (age < 2)  tranche = 'NOURR';
-  else if (age < 15) tranche = 'ENFANT';
-  else if (age < 60) tranche = 'ADULTE';
-  else tranche = 'SENIOR';
+  if (known) {
+    if (age < 0.08) tranche = 'NN';
+    else if (age < 2)  tranche = 'NOURR';
+    else if (age < 15) tranche = 'ENFANT';
+    else if (age < 60) tranche = 'ADULTE';
+    else tranche = 'SENIOR';
+  }
   return { age, sexe, tranche };
 }
 
@@ -146,24 +154,19 @@ const NORM = {
     SENIOR: { M:'0.70–1.26', F:'0.70–1.26', lo:0.70, hi:1.26 },
   },
   hba:  { _all: { ref:'< 6.0', lo:0, hi:6.0 } },
-  crea: {
-    NN:     { M:'25–90',  F:'25–90',  lo:25,  hi:90  },
-    NOURR:  { M:'18–35',  F:'18–35',  lo:18,  hi:35  },
-    ENFANT: { M:'27–62',  F:'27–62',  lo:27,  hi:62  },
-    ADULTE: { M:'60–115', F:'45–90',  loM:60, hiM:115, loF:45, hiF:90 },
-    SENIOR: { M:'60–120', F:'45–100', loM:60, hiM:120, loF:45, hiF:100 },
-  },
-  uree: {
-    NN:     { M:'1.0–5.0', F:'1.0–5.0', lo:1.0, hi:5.0 },
-    NOURR:  { M:'1.8–6.4', F:'1.8–6.4', lo:1.8, hi:6.4 },
-    ENFANT: { M:'2.5–6.5', F:'2.5–6.5', lo:2.5, hi:6.5 },
-    ADULTE: { M:'2.5–7.5', F:'2.5–7.5', lo:2.5, hi:7.5 },
-    SENIOR: { M:'3.0–9.0', F:'3.0–9.0', lo:3.0, hi:9.0 },
-  },
-  ua: {
-    ADULTE: { M:'210–420', F:'150–360', loM:210, hiM:420, loF:150, hiF:360 },
-    _default: { ref:'150–420', lo:150, hi:420 },
-  },
+  // ✅ v13.143 — Ces bornes étaient exprimées en µmol/L alors que la saisie et
+  // l'impression sont en mg/L (liste canonique BIO_REIN : 4–16 mg/L). Toute
+  // créatinine était donc signalée anormale et la référence imprimée était
+  // fausse. On s'aligne sur la liste canonique.
+  crea: { _all: { ref:'4–16', lo:4, hi:16 } },
+  // ✅ v13.143 — Bornes en g/L (liste canonique BIO_REIN : 0.15–0.45 g/L).
+  // ⚠ Références NON modifiées (demande explicite) : seul le RÉSULTAT de l'urée
+  //   est déduit de la créatinine (créat / 44), pas les valeurs normales.
+  uree: { _all: { ref:'0.15–0.45', lo:0.15, hi:0.45 } },
+  // ✅ v13.145 — Bornes en µmol/L alors que la saisie et l'impression sont en
+  // mg/L (liste canonique BIO_REIN : 25–70 mg/L). Tout acide urique était
+  // signalé anormal et la référence imprimée était fausse.
+  ua: { _all: { ref:'25–70', lo:25, hi:70 } },
   asat: { _all: { ref:'< 40', lo:0, hi:40 } },
   alat: {
     ADULTE: { M:'< 45', F:'< 35', lo:0, hiM:45, hiF:35 },
@@ -256,10 +259,10 @@ function buildRefObj(entry, profile) {
 
 // ──────────────────────────────────────────────────────────────────────
 // VALEURS DE RÉFÉRENCE PERSONNALISÉES (admin)
-// Stockées dans localStorage 'v2_labosaisie_refs_v1'
+// Stockées dans localStorage 'labosaisie_refs_v1'
 // Format : { paramId: { lo, hi, ref, unit } }
 // ──────────────────────────────────────────────────────────────────────
-const LABO_REFS_KEY = 'v2_labosaisie_refs_v1';
+const LABO_REFS_KEY = 'labosaisie_refs_v1';
 
 // Cache en mémoire pour éviter de parser localStorage à chaque frappe
 let _customRefsCache = null;
@@ -536,10 +539,14 @@ const SERO_TESTS = [
   { id:'hbsac', name:'Ac anti-HBs',           type:'quant', unit:'UI/L' },
   { id:'hcv',   name:'Ac anti-VHC',           type:'qual' },
   { id:'syphil',name:'TPHA / VDRL (Syphilis)',type:'qual' },
-  { id:'toxo',  name:'Toxoplasmose IgG',      type:'quant', unit:'UI/mL' },
+  // ✅ v13.145 — Ces sérologies sont majoritairement rendues en QUALITATIF au
+  // laboratoire (et toujours en qualitatif dans le bilan prénatal). Le mode
+  // quantitatif reste disponible au cas par cas via le sélecteur qual/quant :
+  // seul le défaut change, l'unité est conservée pour ce cas.
+  { id:'toxo',  name:'Toxoplasmose IgG',      type:'qual', unit:'UI/mL' },
   { id:'toxoig',name:'Toxoplasmose IgM',      type:'qual' },
-  { id:'rubig', name:'Rubéole IgG',           type:'quant', unit:'UI/mL' },
-  { id:'aso',   name:'ASLO (Antistreptolysines)', type:'quant', unit:'UI/mL' },
+  { id:'rubig', name:'Rubéole IgG',           type:'qual', unit:'UI/mL' },
+  { id:'aso',   name:'ASLO (Antistreptolysines)', type:'qual', unit:'UI/mL' },
   { id:'latex', name:'Latex (Waaler-Rose)',    type:'qual' },
   { id:'tsh',   name:'TSH',                   type:'quant', unit:'mUI/L' },
   { id:'ft4',   name:'T4 libre (FT4)',        type:'quant', unit:'pmol/L' },
@@ -625,7 +632,9 @@ function makeParamRowColored(p, tbody) {
   tbody.appendChild(tr);
 }
 
-function onParamInput(id) {
+// skipMontant : évite de recalculer le montant (indépendant des valeurs) quand
+// cet appel est un effet secondaire d'un autre (ex. urée déduite de la créat).
+function onParamInput(id, skipMontant) {
   const profile = getPatientProfile();
   const ref = getRef(id, profile);
   if (!ref) return;
@@ -635,33 +644,50 @@ function onParamInput(id) {
   const interp = interprete(valEl.value, ref.lo, ref.hi);
   interpEl.textContent = interp || '—';
   interpEl.className = 'interp ' + (interp === 'Élevé' ? 'hi' : interp === 'Bas' ? 'lo' : interp === 'Normal' ? 'ok' : '');
-  updateMontantCurrent();
+  if (!skipMontant) updateMontantCurrent();
+  // ✅ v13.151 — Urée déduite de la créatinine (résultat, pas la référence).
+  // Le montant a déjà été mis à jour ci-dessus → on l'évite pour l'urée.
+  if (id === 'crea') { deduireUreeDeCrea(); onParamInput('uree', true); }
+}
+
+// ✅ v13.151 — Urée (g/L) = créatinine (mg/L) / 44. Source unique de la règle,
+// partagée par le formulaire et la saisie en série. Créatinine vidée → urée vidée
+// (pas de valeur périmée qui contredirait la créatinine absente).
+function deduireUreeDeCrea() {
+  const u = document.getElementById('v_uree');
+  if (!u) return;
+  const c = parseFloat(document.getElementById('v_crea')?.value);
+  u.value = isNaN(c) ? '' : (c / 44).toFixed(2);
 }
 
 // Variante NFS : colore directement la case input selon l'interprétation,
 // sans afficher de texte d'interprétation (pas de colonne dédiée).
-function onParamInputColored(id) {
+function onParamInputColored(id, skipMontant) {
   const profile = getPatientProfile();
   const ref = getRef(id, profile);
   const valEl = document.getElementById('v_' + id);
   if (!valEl) return;
   if (!ref || valEl.value === '') {
     valEl.classList.remove('val-hi', 'val-lo');
-    updateMontantCurrent();
+    if (!skipMontant) updateMontantCurrent();
     return;
   }
   // ✅ v13.26 — FL : interprétation sur la valeur absolue × 1000 (/µL)
-  const isFL = HEMA_FL && HEMA_FL.some(p => p.id === id);
+  const pFL = (typeof HEMA_FL !== 'undefined') ? HEMA_FL.find(p => p.id === id) : null;
   let val = parseFloat(valEl.value);
-  if (isFL) {
+  let lo = ref.lo, hi = ref.hi;
+  if (pFL) {
+    // ✅ v13.143 — On comparait la valeur ABSOLUE (/µL) aux bornes en POURCENTAGE
+    // (ex. PNN 2670 contre 50–70) : les cinq lignes de la formule étaient donc
+    // toujours signalées anormales. Absolu ⇄ bornes absolues, % ⇄ bornes %.
     const absEl = document.getElementById('abs_' + id);
     const absVal = absEl ? parseFloat(absEl.textContent) : NaN;
-    if (!isNaN(absVal)) val = absVal * 1000; // convertir en /µL pour comparer aux refs
+    if (!isNaN(absVal)) { val = absVal * 1000; lo = pFL.lo; hi = pFL.hi; }
   }
-  const interp = interprete(val, ref.lo, ref.hi);
+  const interp = interprete(val, lo, hi);
   valEl.classList.toggle('val-hi', interp === 'Élevé');
   valEl.classList.toggle('val-lo', interp === 'Bas');
-  updateMontantCurrent();
+  if (!skipMontant) updateMontantCurrent();
   if (id === 'hb' || id === 'ht' || id === 'gr') { if (typeof calcConstantes === 'function') calcConstantes(); }
   if (id === 'gbc') { if (typeof calcFLAbsolues === 'function') calcFLAbsolues(); }
   if (id === 'bpn_hb' || id === 'bpn_ht' || id === 'bpn_gr') { if (typeof calcConstantesBPN === 'function') calcConstantesBPN(); }
@@ -727,10 +753,12 @@ const BPN_EXAMENS = [
   { id:'bpnc_ephb',  label:'Électrophorèse de l\'hémoglobine', def:true },
   { id:'bpnc_rube',  label:'Rubéole IgG / IgM', def:true },
   { id:'bpnc_toxo',  label:'Toxoplasmose IgG / IgM', def:true },
-  { id:'bpnc_vih',   label:'Sérologie VIH', def:true },
   { id:'bpnc_hbs',   label:'Ag HBs (Hépatite B)', def:true },
   { id:'bpnc_tpha',  label:'TPHA / VDRL (Syphilis)', def:true },
-  { id:'bpnc_ecbu',  label:'ECBU', def:true },
+  // ✅ v13.147 — VIH et ECBU rarement demandés en prénatal : décochés par
+  // défaut (restent cochables au cas par cas), au même titre que l'ECBU.
+  { id:'bpnc_vih',   label:'Sérologie VIH', def:false },
+  { id:'bpnc_ecbu',  label:'ECBU', def:false },
 ];
 
 function buildBpnCompo() {
@@ -751,9 +779,15 @@ function collectBpnCompo() {
 // fiches déjà existantes (NFS, EPHB, Bio, GS, Sérologies, ECBU).
 // ✅ v13.28 — BPN forfaitaire : les 12 examens inclus passent à 0 F
 // (compris dans le forfait 20 000). Décocher BPN restaure les tarifs.
+// Sérologies incluses dans le bilan prénatal (toujours qualitatives).
+const BPN_SERO_IDS = ['vih1', 'hbsag', 'syphil', 'toxo', 'toxoig', 'rubig'];
+
 function applyBpnSections() {
   const on = !!document.getElementById('ex_bpn')?.checked;
-  const bpnExamIds = ['ex_nfs','ex_ephb','ex_gly','ex_uree','ex_crea','ex_gs','ex_vih','ex_hbs','ex_tpha','ex_toxo','ex_rube','ex_ecbu'];
+  // ✅ v13.147 — VIH et ECBU RETIRÉS de la composition par défaut du forfait :
+  // ils sont rarement demandés en prénatal ici. Ils restent cochables au cas par
+  // cas (ex_vih / ex_ecbu sur leurs onglets), mais ne sont plus inclus d'office.
+  const bpnExamIds = ['ex_nfs','ex_ephb','ex_gly','ex_uree','ex_crea','ex_gs','ex_hbs','ex_tpha','ex_toxo','ex_rube'];
   bpnExamIds.forEach(id => {
     const chk = document.getElementById(id);
     if (chk && on && !chk.checked) {
@@ -776,6 +810,25 @@ function applyBpnSections() {
     }
   });
   if (typeof applyExamLocks === 'function') applyExamLocks();
+  // ✅ v13.145 — Les sérologies du bilan prénatal sont TOUJOURS qualitatives.
+  // ⚠ APRÈS applyExamLocks : celui-ci déverrouille les champs de tout examen
+  // coché, y compris le sélecteur qual/quant — il annulerait ce verrou.
+  BPN_SERO_IDS.forEach(sid => {
+    const m = document.getElementById('smode_' + sid);
+    if (!m) return;
+    if (on) {
+      if (m.dataset.prevMode === undefined) m.dataset.prevMode = m.value;
+      m.value = 'qual';
+      m.disabled = true;
+      m.title = 'Bilan prénatal : sérologie rendue en qualitatif';
+    } else if (m.dataset.prevMode !== undefined) {
+      m.value = m.dataset.prevMode;
+      delete m.dataset.prevMode;
+      m.disabled = false;
+      m.title = '';
+    }
+    if (typeof toggleSeroMode === 'function') { try { toggleSeroMode(sid); } catch (e) {} }
+  });
 }
 
 
@@ -1058,10 +1111,14 @@ function buildHema() {
     const profile = getPatientProfile();
     const dynRef = getRef(p.id, profile);
     const refDisplay = dynRef ? dynRef.ref : (p.ref || '');
+    // ✅ v13.151 — Éosinophiles et Basophiles CALCULÉS (baso=0 ; éosino=reste) :
+    //   champs en lecture seule pour éviter toute saisie contradictoire.
+    const _auto = FL_COMPUTED.indexOf(p.id) >= 0;
+    const _ro = _auto ? ' readonly title="Calculé automatiquement" style="width:75px;background:#f1f3f5;color:#555"' : ' style="width:75px"';
     tr.innerHTML = `
-      <td style="font-size:13px">${p.name}</td>
-      <td><input type="number" id="v_${p.id}" step="any" min="0" max="100" style="width:75px"
-          oninput="onParamInputColored('${p.id}'); calcFLAbsolues()"></td>
+      <td style="font-size:13px">${p.name}${_auto ? ' <span style="font-size:9px;color:#94a3b8">(auto)</span>' : ''}</td>
+      <td><input type="number" id="v_${p.id}" step="any" min="0" max="100"${_ro}
+          oninput="onFLParamInput('${p.id}')"></td>
       <td>
         <span class="unit">%</span>
         <span style="display:inline-block;margin-left:6px;min-width:60px;font-size:11px;color:var(--accent);font-weight:600" id="abs_${p.id}"></span>
@@ -1103,6 +1160,49 @@ function buildHema() {
   // Brancher calcul FL absolues sur GB
   const gbEl = document.getElementById('v_gbc');
   if (gbEl) gbEl.addEventListener('input', calcFLAbsolues);
+}
+
+// ✅ v13.151 — Formule leucocytaire : quels champs sont SAISIS (pilotes) et quels
+// champs sont CALCULÉS (baso=0 ; éosino=reste). Défini une seule fois, utilisé par
+// le gabarit de ligne (lecture seule) ET par le calcul → pas de liste dupliquée.
+const FL_DRIVERS  = ['pnn', 'lymp', 'mono'];
+const FL_COMPUTED = ['pne', 'pnb'];
+
+// ✅ v13.151 — Formule leucocytaire semi-automatique (demande labo) :
+//   • Basophiles = 0 (dès qu'on saisit la formule).
+//   • Éosinophiles = 100 − (Neutrophiles + Lymphocytes + Monocytes) ; VIDE tant
+//     que les trois ne sont pas saisis (évite toute valeur périmée d'un patient
+//     précédent lors de la saisie en série).
+//   N'est appelée QUE sur saisie utilisateur d'un pilote (neutro/lympho/mono),
+//   jamais au chargement d'un dossier existant → ne réécrit pas un PNE/PNB
+//   historique déjà enregistré.
+function calcFLAuto() {
+  const g = id => { const v = parseFloat(document.getElementById('v_' + id)?.value); return isNaN(v) ? null : v; };
+  const setV = (id, val) => { const el = document.getElementById('v_' + id); if (el) el.value = val; };
+  if (document.getElementById('v_pnb')) setV('pnb', '0');
+  const pnn = g('pnn'), lymp = g('lymp'), mono = g('mono');
+  if (document.getElementById('v_pne')) {
+    if (pnn !== null && lymp !== null && mono !== null) {
+      let pne = Math.round((100 - (pnn + lymp + mono)) * 10) / 10;
+      if (pne < 0) pne = 0;
+      setV('pne', pne);
+    } else {
+      setV('pne', ''); // formule incomplète : pas de valeur périmée
+    }
+  }
+}
+
+// Saisie d'un paramètre de la formule leucocytaire : recalcule baso/éosino
+// uniquement quand l'utilisateur touche un pilote, puis les valeurs absolues.
+// Le montant (indépendant des valeurs) n'est mis à jour qu'une fois, via la
+// coloration du champ édité ; on l'évite pour la recoloration de pne/pnb.
+function onFLParamInput(id) {
+  onParamInputColored(id);
+  if (FL_DRIVERS.indexOf(id) >= 0) {
+    calcFLAuto();
+    FL_COMPUTED.forEach(x => { try { onParamInputColored(x, true); } catch (e) {} });
+  }
+  calcFLAbsolues();
 }
 
 function calcFLAbsolues() {
