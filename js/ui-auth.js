@@ -53,7 +53,7 @@ function showConfirmModal({ icon = '❓', title = 'Confirmer', message = '', con
 // AUTHENTIFICATION — comptes multi-utilisateurs
 // ============================================================
 
-const SESSION_KEY = 'v2_labo_session_user';
+const SESSION_KEY = 'labo_session_user';
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // ✅ v2: 24 heures (recommandé système médical)
 
 // Utilisateur actuellement connecté : { id, username, role, expiresAt }
@@ -104,6 +104,31 @@ function isSpectateur() {
 function blockIfSpectateur() {
   if (isSpectateur()) { toast('👁 Compte spectateur — lecture seule, aucune action possible', 'err'); return true; }
   return false;
+}
+
+// ✅ v13.122 — Encaissement : admin et caissier toujours ; un agent PEUT encaisser
+// UNIQUEMENT s'il n'existe aucun compte caissier (petit labo sans caisse dédiée).
+// window._noCaissier est renseigné par chargerEtatCaissier() après connexion.
+function peutEncaisser() {
+  if (isAdmin() || isCaissier()) return true;
+  if (isSpectateur()) return false;
+  return window._noCaissier === true;
+}
+// Un agent « fait la caisse » (pas de caissier) — utile pour l'aiguillage des vues.
+function agentFaitCaisse() {
+  return !isAdmin() && !isCaissier() && !isSpectateur() && window._noCaissier === true;
+}
+async function chargerEtatCaissier() {
+  try {
+    if (!_sb || typeof TK !== 'function' || !TK()) return;
+    const { data, error } = await _sb.rpc('caissier_exists', { p_token: TK() });
+    if (!error && typeof data === 'boolean') {
+      window._noCaissier = (data === false);
+      // Rafraîchir l'aiguillage des vues et la barre d'outils si déjà affichés.
+      try { if (typeof updateBandeauPaiement === 'function') updateBandeauPaiement(); } catch (e) {}
+      try { if (typeof updateBulkToolbar === 'function') updateBulkToolbar(); } catch (e) {}
+    }
+  } catch (e) { /* réseau : on laisse la valeur par défaut (caisse présente) */ }
 }
 
 // ✅ v13.33 — Secousse de la carte quand une erreur de connexion apparaît.
@@ -208,16 +233,23 @@ function updateUserBadge() {
   }
   // ✅ v13.33 — btn-clear-history supprimé ; btn-masquees géré par updateMasqueesBtn()
   updateMasqueesBtn();
+  // ✅ v13.122 — Savoir s'il existe un caissier (sinon un agent peut encaisser).
+  if (typeof chargerEtatCaissier === 'function') chargerEtatCaissier();
+  // ✅ v13.127 — Charger la liste des journées verrouillées.
+  if (typeof chargerClotures === 'function') chargerClotures();
   const usersNavBtn = document.getElementById('btn-nav-users');
   if (usersNavBtn) usersNavBtn.style.display = isAdmin() ? '' : 'none';
-  // ✅ v13.92 — Le cahier jaune n'appartient qu'à l'administrateur, qui peut
-  // l'ouvrir à d'autres profils. L'onglet est donc masqué par défaut, puis
-  // révélé par chargerAccesCahier() une fois les droits connus du serveur :
-  // c'est lui qui tranche, pas le rôle seul.
+  // ✅ v13.107 — L'onglet du cahier jaune et ses cartes de réglage restent
+  // masqués TANT QUE le serveur n'a pas confirmé l'accès. On ne les révèle
+  // plus « parce qu'on est admin » : depuis la seconde porte, un admin en
+  // session ordinaire ne doit voir aucun indice du cahier. Les afficher ici,
+  // même une fraction de seconde avant la réponse serveur, trahirait la
+  // porte — et un échec réseau les laisserait visibles pour de bon.
+  // C'est chargerAccesCahier() qui, et lui seul, les fait apparaître.
   const cahierNavBtn = document.getElementById('btn-nav-cahier');
-  if (cahierNavBtn) cahierNavBtn.style.display = isAdmin() ? '' : 'none';
+  if (cahierNavBtn) cahierNavBtn.style.display = 'none';
   const cahierColBtn = document.getElementById('cahier-colonnes-card');
-  if (cahierColBtn) cahierColBtn.style.display = isAdmin() ? '' : 'none';
+  if (cahierColBtn) cahierColBtn.style.display = 'none';
   if (typeof chargerAccesCahier === 'function') chargerAccesCahier();
   // ✅ v13.33 — tarifs-config-card et refs-config-card sont dans des sous-onglets,
   // leur visibilité est gérée par adminShowSub — rien à faire ici.
@@ -228,8 +260,24 @@ function updateUserBadge() {
   if (saisieNavBtn) saisieNavBtn.style.display = (isCaissier() || isSpectateur()) ? 'none' : '';
   const exportAllBtn = document.querySelector('header .nav-btn[onclick="exportAllExcel()"]');
   if (exportAllBtn) exportAllBtn.style.display = (isCaissier() || isSpectateur()) ? 'none' : '';
-  // Afficher directement la caisse pour le caissier / spectateur après connexion
-  if (isCaissier() || isSpectateur()) setTimeout(() => showView('caisse'), 50);
+  // ✅ v13.109 — Au chargement, revenir sur le dernier onglet consulté plutôt
+  // que de retomber systématiquement sur « Nouveau patient ». Le défaut par
+  // rôle (caisse pour le caissier/spectateur, saisie pour l'admin/agent) ne
+  // s'applique qu'à défaut d'onglet mémorisé ou si le rôle n'y a pas droit.
+  setTimeout(() => restaurerDerniereVue(), 50);
+}
+
+function restaurerDerniereVue() {
+  // Les vues de travail auxquelles CE rôle a droit. Le cahier jaune et les
+  // Comptes en sont volontairement absents (voir showView).
+  const permises = (isCaissier() || isSpectateur())
+    ? ['historique','stats','caisse']
+    : ['saisie','historique','stats','caisse'];   // admin, agent
+  let v = null;
+  try { v = localStorage.getItem('labo_vue_courante'); } catch (e) {}
+  if (v && permises.includes(v)) { showView(v); return; }
+  // À défaut : le point de départ habituel de chaque rôle.
+  showView((isCaissier() || isSpectateur()) ? 'caisse' : 'saisie');
 }
 
 // ============================================================
@@ -293,7 +341,7 @@ async function renderConnexions() {
       + '</tr>';
   }).join('');
   // Marquer comme vues → efface le badge
-  if (conns[0]?.ts) localStorage.setItem('v2_labo_last_seen_conn', conns[0].ts);
+  if (conns[0]?.ts) localStorage.setItem('labo_last_seen_conn', conns[0].ts);
   updateConnexionsBadge(0);
 }
 
@@ -324,7 +372,7 @@ async function checkNewConnexions(allowNotify) {
       (e.action === 'login' || e.action === 'logout')
       && (e.username || e.details?.user) !== _currentUser?.username);
     // Badge : événements depuis la dernière consultation de l'onglet Connexions
-    const lastSeen = localStorage.getItem('v2_labo_last_seen_conn');
+    const lastSeen = localStorage.getItem('labo_last_seen_conn');
     const n = lastSeen ? conns.filter(e => e.ts > lastSeen).length : conns.length;
     updateConnexionsBadge(n);
     // Notification en direct : nouveaux événements depuis le dernier passage
@@ -403,6 +451,27 @@ async function renderUsersList() {
   }).join('');
 }
 
+
+// ✅ v13.103 — Le menu proposait « Prescripteur » depuis la v13.96, mais
+// l'appel n'envoyait pas le soignant à rattacher : la création échouait donc
+// systématiquement, sans que rien à l'écran n'explique pourquoi.
+function majBlocPrescripteur() {
+  const role = document.getElementById('nu_role')?.value;
+  const bloc = document.getElementById('nu-presc-bloc');
+  const sel  = document.getElementById('nu_prescripteur');
+  if (!bloc || !sel) return;
+  const actif = role === 'prescripteur';
+  bloc.style.display = actif ? '' : 'none';
+  if (!actif) return;
+  const liste = (typeof _prescripteurs !== 'undefined' && Array.isArray(_prescripteurs))
+    ? _prescripteurs.filter(p => p.actif !== false) : [];
+  sel.innerHTML = '<option value="">— choisir —</option>' +
+    liste.map(p => `<option value="${p.id}">${escHTML(p.nom)}</option>`).join('');
+}
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('nu_role')?.addEventListener('change', majBlocPrescripteur);
+});
+
 async function createUserAccount() {
   const errEl = document.getElementById('nu-error');
   errEl.textContent = '';
@@ -420,11 +489,21 @@ async function createUserAccount() {
     return;
   }
 
+  let prescId = null;
+  if (role === 'prescripteur') {
+    prescId = parseInt(document.getElementById('nu_prescripteur')?.value || '', 10);
+    if (!prescId) {
+      errEl.textContent = 'Choisissez le soignant auquel rattacher ce compte.';
+      return;
+    }
+  }
+
   const { data, error } = await _sb.rpc('create_user_admin', {
     p_token: TK(),
     p_new_username: username,
     p_new_password: password,
     p_new_role: role,
+    p_prescripteur_id: prescId,
   });
   if (error) {
     console.error('Erreur create_user_admin:', error);
