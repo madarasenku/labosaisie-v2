@@ -282,7 +282,17 @@ function makeFilename(dossier, date, nom, type) {
   return [safe(type), safe(nom)||'PATIENT', safe(dossier), d].filter(Boolean).join('_') + '.xlsx';
 }
 
-function buildProfessionalSheet(wb, r, sheetName) {
+function buildProfessionalSheet(wb, r, sheetName, opts) {
+  // ✅ v13.148 — opts (facultatif) :
+  //   render      : [{type,res}]  → corps à rendre sur CETTE feuille (défaut : le
+  //                 seul type de r). Permet de COMBINER plusieurs analyses sur une
+  //                 même feuille (bilan prénatal : Héma+Groupe puis Bio+Séro).
+  //   bpn         : bool          → réglages prénatals (électrophorèse = profil en
+  //                 grand sans pourcentages ; pas de Widal).
+  //   montant     : number        → montant affiché (forfait BPN = 20 000).
+  //   pending     : [{label,rows}] → examens demandés non remplis (à compléter).
+  //   composition : [string]      → « _bpn_inclus » (traçabilité du forfait).
+  opts = opts || {};
   // ── Helpers globaux ──────────────────────────────────────────
   const p = r.patient || {};
   const res = r.resultats || {};
@@ -291,26 +301,29 @@ function buildProfessionalSheet(wb, r, sheetName) {
   const dateF  = p.date ? p.date.split('-').reverse().join('/') : '—';
   const ageSexeF = [p.age ? p.age + ' ans' : '', p.sexe === 'M' ? 'Masculin' : p.sexe === 'F' ? 'Féminin' : p.sexe || ''].filter(Boolean).join(' · ');
 
-  // Palette
-  const BLU  = 'FF1E3A8A'; // bleu profond CPMI
-  const BLU2 = 'FF2563EB'; // bleu vif
-  const GLD  = 'FFCBA135'; // or
+  // ✅ v13.111 — RENDU NOIR & BLANC (économie d'encre, impression N&B).
+  //   Plus aucune couleur : surlignage GRIS uniquement sur les valeurs anormales.
+  //   La palette garde les mêmes noms — tout le rendu bascule sans toucher au
+  //   câblage des données.
+  const BLU  = 'FF111111'; // ex-bleu → encre noire (texte, filets, accents)
+  const BLU2 = 'FF333333';
+  const GLD  = 'FFDDDDDD'; // ex-or → gris clair (liserés / séparateurs)
   const WHT  = 'FFFFFFFF';
-  const PAT_LABEL = 'FFE8F0FE'; // fond étiquette patient
-  const PAT_VAL   = 'FFFAFCFF'; // fond valeur patient
-  const SEC_BG    = 'FFDBEAFE'; // fond titre de section
-  const SEC_FG    = 'FF1E3A8A';
-  const TH_BG     = 'FF1E3A8A';
-  const TH_FG     = 'FFFFFFFF';
+  const PAT_LABEL = 'FFEDEDED'; // fond étiquette patient (gris très clair)
+  const PAT_VAL   = 'FFFFFFFF'; // fond valeur patient (blanc)
+  const SEC_BG    = 'FFE0E0E0'; // fond titre de section (gris clair)
+  const SEC_FG    = 'FF111111';
+  const TH_BG     = 'FFE0E0E0'; // en-tête de tableau (gris clair)
+  const TH_FG     = 'FF111111'; // texte foncé (fond clair)
   const PAR_W     = 'FFFFFFFF'; // ligne paire
-  const PAR_A     = 'FFF5F8FF'; // ligne impaire légère
-  // ✅ v13.18 — couleurs anormales plus visibles
-  const HI_BG     = 'FFFDE8E8'; const HI_FG = 'FF991B1B'; // rouge
-  const LO_BG     = 'FFE8F0FE'; const LO_FG = 'FF1E40AF'; // bleu
-  const OK_BG     = 'FFE8F8EE'; const OK_FG = 'FF155724'; // vert
-  const MUTED     = 'FF6B7280';
-  const DARK      = 'FF111827';
-  const BRD       = 'FFD1D9E6';
+  const PAR_A     = 'FFFFFFFF'; // ligne impaire — plus de zébrage (économie d'encre)
+  // Surlignage anormal = GRIS marqué ; normal = blanc (pas de surlignage)
+  const HI_BG     = 'FFC9C9C9'; const HI_FG = 'FF111111'; // élevé / positif → gris
+  const LO_BG     = 'FFC9C9C9'; const LO_FG = 'FF111111'; // bas → gris
+  const OK_BG     = 'FFFFFFFF'; const OK_FG = 'FF111111'; // normal → blanc
+  const MUTED     = 'FF555555';
+  const DARK      = 'FF111111';
+  const BRD       = 'FFB0B0B0';
 
   function tB(col) { const b={style:'thin',color:{argb:col||BRD}}; return {top:b,bottom:b,left:b,right:b}; }
   function medB(col) { const b={style:'medium',color:{argb:col||BLU}}; return {top:b,bottom:b,left:b,right:b}; }
@@ -352,6 +365,11 @@ function buildProfessionalSheet(wb, r, sheetName) {
       margins:{left:0.4,right:0.4,top:0.4,bottom:0.4,header:0.15,footer:0.15} },
     views: [{ showGridLines:false, state:'frozen', ySplit:10 }],
   });
+  // ✅ v13.151 — Numéro de page en bas (visible à l'impression) : « Page X / Y ».
+  ws.headerFooter = {
+    oddFooter: '&C&"Calibri"&8Page &P / &N',
+    evenFooter: '&C&"Calibri"&8Page &P / &N',
+  };
   ws.columns = [
     {width:37}, {width:20}, {width:12},
     {width:12}, {width:20}, {width:14},
@@ -373,7 +391,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
   mg(row,1,row,NC);
   const cCentre = ws.getCell(row,1);
   cCentre.value = 'CPMI DE GRAND-BASSAM  —  Centre de Protection Mère et Infantile';
-  sC(cCentre, {bg:BLU, fg:WHT, bold:true, size:13, ha:'center'});
+  sC(cCentre, {bg:SEC_BG, fg:DARK, bold:true, size:13, ha:'center'});
   row++;
 
   // Sous-titre + type analyse (2 colonnes)
@@ -387,11 +405,11 @@ function buildProfessionalSheet(wb, r, sheetName) {
   mg(row,1,row,4);
   const cSub = ws.getCell(row,1);
   cSub.value = subT;
-  sC(cSub, {bg:BLU, fg:'FFBFDBFE', size:9, italic:true});
+  sC(cSub, {bg:SEC_BG, fg:MUTED, size:9, italic:true});
   mg(row,5,row,NC);
   const cType = ws.getCell(row,5);
   cType.value = typeT;
-  sC(cType, {bg:BLU, fg:'FFFBBF24', bold:true, size:10, ha:'right'});
+  sC(cType, {bg:SEC_BG, fg:DARK, bold:true, size:10, ha:'right'});
   row++;
 
   // Liseré or bas
@@ -457,7 +475,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
     mg(row,1,row,NC);
     const c = ws.getCell(row,1);
     c.value = title.replace(/[^\w\s\-–·'àâäéèêëîïôùûüç%°()\/,.:]/g, '').trim();
-    sC(c, {bg:SEC_BG, fg:SEC_FG, bold:true, size:10});
+    sC(c, {bg:SEC_BG, fg:SEC_FG, bold:true, size:11.5});
     c.border = { top:{style:'medium',color:{argb:BLU}}, bottom:{style:'thin',color:{argb:BLU}},
       left:tB().left, right:tB().right };
     row++;
@@ -467,7 +485,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
   // tblHdr : mêmes fusions que pRow pour éviter tout conflit ExcelJS
   function tblHdr(label, valeur, unite, ref) {
     const rr = ws.getRow(row); rr.height = 15;
-    const th = {bg:TH_BG, fg:TH_FG, bold:true, size:9, wt:false};
+    const th = {bg:TH_BG, fg:TH_FG, bold:true, size:10, wt:false};
     sC(rr.getCell(1), {...th, ha:'left'});   rr.getCell(1).value = label  || 'Paramètre';
     sC(rr.getCell(2), {...th, ha:'center'}); rr.getCell(2).value = valeur || 'Valeur';
     sC(rr.getCell(3), {...th, ha:'center'}); rr.getCell(3).value = unite  || 'Unité';
@@ -493,11 +511,12 @@ function buildProfessionalSheet(wb, r, sheetName) {
     rr.height = fitH([
       {text:nom, c1:1}, {text:valeur, c1:2}, {text:unite, c1:3}, {text:ref, c1:4, c2:NC}
     ], 16);
-    sC(rr.getCell(1), {bg,    fg:DARK,  size:9.5, border:true}); rr.getCell(1).value = nom;
-    sC(rr.getCell(2), {bg:vBg, fg:vFg,  bold:true, size:11, ha:'center', border:true}); rr.getCell(2).value = valeur;
-    sC(rr.getCell(3), {bg,    fg:MUTED, size:9,    ha:'center', border:true}); rr.getCell(3).value = unite||'';
+    // ✅ v13.153 — Texte du rapport un peu plus grand (plus lisible à l'impression).
+    sC(rr.getCell(1), {bg,    fg:DARK,  size:10.5, border:true}); rr.getCell(1).value = nom;
+    sC(rr.getCell(2), {bg:vBg, fg:vFg,  bold:true, size:13, ha:'center', border:true}); rr.getCell(2).value = valeur;
+    sC(rr.getCell(3), {bg,    fg:MUTED, size:10,   ha:'center', border:true}); rr.getCell(3).value = unite||'';
     mg(row,4,row,NC);
-    sC(rr.getCell(4), {bg,    fg:MUTED, size:9,    ha:'center', border:true}); rr.getCell(4).value = ref||'';
+    sC(rr.getCell(4), {bg,    fg:MUTED, size:10,   ha:'center', border:true}); rr.getCell(4).value = ref||'';
     row++;
   }
 
@@ -507,11 +526,11 @@ function buildProfessionalSheet(wb, r, sheetName) {
     const bg = alt ? PAR_A : PAR_W;
     const rr = ws.getRow(row);
     rr.height = fitH([{text:nom, c1:1}, {text:ref, c1:4, c2:NC}], 18);
-    sC(rr.getCell(1), {bg, fg:DARK, size:9.5, border:true}); rr.getCell(1).value = nom;
+    sC(rr.getCell(1), {bg, fg:DARK, size:10.5, border:true}); rr.getCell(1).value = nom;
     sC(rr.getCell(2), {bg:'FFFFFFFF', fg:DARK, border:true}); rr.getCell(2).value = '';
-    sC(rr.getCell(3), {bg, fg:MUTED, size:9, ha:'center', border:true}); rr.getCell(3).value = unite||'';
+    sC(rr.getCell(3), {bg, fg:MUTED, size:10, ha:'center', border:true}); rr.getCell(3).value = unite||'';
     mg(row,4,row,NC);
-    sC(rr.getCell(4), {bg, fg:MUTED, size:9, ha:'center', border:true}); rr.getCell(4).value = ref||'';
+    sC(rr.getCell(4), {bg, fg:MUTED, size:10, ha:'center', border:true}); rr.getCell(4).value = ref||'';
     row++;
   }
 
@@ -530,7 +549,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
     rr.height = fitH([{text, c1:1, c2:NC}], 20); // ✅ v12.2 — observations multi-lignes
     mg(row,1,row,NC);
     const c = rr.getCell(1);
-    sC(c, {bg:bgColor||'FFFFFDE7', fg:'FF78350F', italic:true, size:9.5, border:true});
+    sC(c, {bg:bgColor||'FFEDEDED', fg:DARK, italic:true, size:9.5, border:true});
     c.value = text;
     row++;
   }
@@ -544,7 +563,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
     let vBg=bg, vFg=DARK;
     if (val==='S'){vBg=OK_BG;vFg=OK_FG;}
     else if (val==='R'){vBg=HI_BG;vFg=HI_FG;}
-    else if (val==='I'){vBg='FFFFFBEB';vFg='FFB45309';}
+    else if (val==='I'){vBg='FFDDDDDD';vFg=DARK;}
     const rr = ws.getRow(row);
     rr.height = fitH([{text:nom, c1:1}, {text:label, c1:2, c2:NC}], 15); // ✅ v12.2
     sC(rr.getCell(1),{bg,fg:DARK,size:9.5,border:true}); rr.getCell(1).value=nom;
@@ -555,9 +574,12 @@ function buildProfessionalSheet(wb, r, sheetName) {
 
   // ════════════════════════════════════════════════════
   // CONTENU PAR TYPE D'ANALYSE
+  // ✅ v13.148 — extrait en fonction pour pouvoir combiner plusieurs analyses
+  //   sur une même feuille (bilan prénatal). `bt` = type rendu, `res` = ses
+  //   sous-résultats.
   // ════════════════════════════════════════════════════
-
-  if (r.type === 'Hématologie') {
+  function renderTypeBody(bt, res) {
+  if (bt === 'Hématologie') {
     const nfsVals = [...HEMA_PARAMS,...HEMA_FL].filter(q=>res[q.name]&&res[q.name].valeur);
     if (nfsVals.length) {
       secHdr('NFS — Numération Formule Sanguine');
@@ -569,8 +591,10 @@ function buildProfessionalSheet(wb, r, sheetName) {
       });
       row++;
     }
+    // ✅ v13.148 — En BPN, l'électrophorèse est rendue à part (profil en grand,
+    //   sans pourcentages) par bigProfil() : on saute donc le tableau ici.
     const ephbNames=['Hb A','Hb A2','Hb F','Hb S','Hb C','Hb D','Hb E'].filter(n=>res[n]&&res[n].valeur);
-    if (ephbNames.length||res['Profil Hb']) {
+    if (!opts.bpn && (ephbNames.length||res['Profil Hb'])) {
       secHdr("Electrophorese de l'Hemoglobine");
       tblHdr('Fraction', '%', '', 'Valeur normale');
       ephbNames.forEach(n=>{const v=res[n]; pRow(n,v.valeur,'%','',v.interp||'');});
@@ -607,17 +631,17 @@ function buildProfessionalSheet(wb, r, sheetName) {
       row++;
     }
     const _wid = widalReport(res);
-    if (_wid.show) {
+    if (!opts.bpn && _wid.show) {
       secHdr('Sérodiagnostic de Widal & Felix');
       if (_wid.rows.length) {
         tblHdr('Antigène', 'Titre', 'Cinétique', 'Commentaire');
         _wid.rows.forEach(w => pRow(w.name, w.titre, w.cinetique || '—', '', w.interp || ''));
       }
-      if (_wid.concl) nRow(_wid.concl.replace(/^[^\w]+/, ''), _wid.concl.includes('ÉTAT') || _wid.concl.includes('DÉBUT') ? 'FFFFF1F1' : 'FFFFFDE7');
+      if (_wid.concl) nRow(_wid.concl.replace(/^[^\w]+/, ''), _wid.concl.includes('ÉTAT') || _wid.concl.includes('DÉBUT') ? 'FFC9C9C9' : 'FFEDEDED');
       row++;
     }
 
-  } else if (r.type === 'Biochimie') {
+  } else if (bt === 'Biochimie') {
     const bioSections = [
       {label:'Glucides', params:BIO_GLUCIDES},
       {label:'Fonction rénale', params:BIO_REIN},
@@ -638,7 +662,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       row++;
     });
 
-  } else if (r.type === 'Bactériologie') {
+  } else if (bt === 'Bactériologie') {
     if (res['Type de prélèvement']) fRow('Type de prélèvement', res['Type de prélèvement']);
     if (res['Site / Précision'])    fRow('Site / Précision', res['Site / Précision']);
     // Macroscopie
@@ -696,7 +720,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       row++;
     }
 
-  } else if (r.type === 'Immuno-Sérologie') {
+  } else if (bt === 'Immuno-Sérologie') {
     const seroVals = (typeof SERO_TESTS!=='undefined') ? SERO_TESTS.filter(t=>{const v=res[t.name];return v&&(v.resultat||v.valeur);}) : [];
     if (seroVals.length) {
       secHdr('Sérologies');
@@ -704,7 +728,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       seroVals.forEach(t=>{
         const v=res[t.name];
         const interp = v.resultat==='Positif'?'Positif' : v.resultat==='Négatif'?'Négatif' : v.resultat||'';
-        pRow(t.name, v.resultat||v.valeur||'', t.unit||'', '', interp);
+        pRow(t.name, v.resultat||v.valeur||'', getUnit('sero_'+t.id, t.unit||''), '', interp);
       });
       row++;
     }
@@ -716,7 +740,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       pRow('CRP Latex', _crp, '', '< 6 mg/L', res['CRP - Valeur'] === 'neg' ? 'Normal' : 'Élevé');
       row++;
     }
-    if (typeof WIDAL_ANTIGENES !== 'undefined') {
+    if (!opts.bpn && typeof WIDAL_ANTIGENES !== 'undefined') {
       const _widD = WIDAL_ANTIGENES.filter(ag => { const w = res['Widal - ' + ag.name]; return w && w.titre; });
       if (_widD.length) {
         secHdr('Sérodiagnostic de Widal & Félix (SWF)');
@@ -736,7 +760,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       row++;
     }
 
-  } else if (r.type === 'Groupe sanguin') {
+  } else if (bt === 'Groupe sanguin') {
     secHdr('Groupe Sanguin ABO / Rhésus');
     tblHdr('Paramètre', 'Résultat', '', '');
     if (res['Groupe ABO']) pRow('Groupe ABO', res['Groupe ABO'], '', '', '');
@@ -744,7 +768,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
     if (res['Commentaire GS']) nRow(res['Commentaire GS']);
     row++;
 
-  } else if (r.type === 'Parasitologie') {
+  } else if (bt === 'Parasitologie') {
     // ✅ v13.37 — CORRECTIF : lisait des clés inexistantes (« Aspect des selles »,
     // « EPS_… ») → section vide. On lit désormais les vraies clés (collectResults).
     secHdr('Examen Parasitologique / Paludisme');
@@ -777,7 +801,7 @@ function buildProfessionalSheet(wb, r, sheetName) {
       }
     });
     if (gRows.length) {
-      secHdr(r.type + ' — Résultats');
+      secHdr(bt + ' — Résultats');
       tblHdr('Paramètre', 'Résultat', 'Unité', '');
       gRows.forEach(q=>pRow(q.n,q.v,q.u,'',q.i));
       row++;
@@ -793,16 +817,46 @@ function buildProfessionalSheet(wb, r, sheetName) {
       afgD.forEach(af=>abgRow(af,res['AFG_'+af])); row++;
     }
   }
+  } // fin renderTypeBody
+
+  // ✅ v13.148 — Électrophorèse en BPN : profil en GRAND, sans les pourcentages.
+  function bigProfil(value) {
+    secHdr("Electrophorese de l'Hemoglobine");
+    ws.getRow(row).height = 34;
+    mg(row,1,row,NC);
+    const c = ws.getCell(row,1);
+    c.value = 'PROFIL : ' + value;
+    sC(c, {bg:PAT_VAL, fg:BLU, bold:true, size:16, ha:'center', border:true});
+    row++;
+  }
+
+  // ✅ v13.148 — Rendu du/des corps : un seul type (défaut) ou plusieurs combinés
+  //   sur cette feuille (bilan prénatal).
+  const _bodies = (Array.isArray(opts.render) && opts.render.length)
+    ? opts.render : [{ type: r.type, res: res }];
+  _bodies.forEach(b => {
+    if (opts.bpn && b.type === 'Hématologie') {
+      // Électrophorèse : profil en grand, pas de pourcentages (rendu spécial),
+      // puis le reste de l'hématologie via renderTypeBody (qui ignore l'ephb en
+      // mode bpn — voir la garde dans la section électrophorèse).
+      renderTypeBody(b.type, b.res);
+      const profil = b.res && b.res['Profil Hb'];
+      if (profil) bigProfil(profil);
+    } else {
+      renderTypeBody(b.type, b.res);
+    }
+  });
 
   // ✅ v12.4 — Composition BPN (traçabilité des examens inclus, forfait fixe)
-  if (Array.isArray(res['_bpn_inclus']) && res['_bpn_inclus'].length) {
-    secHdr('Composition du bilan prénatal (forfait ' + (r.montant||20000).toLocaleString('fr-FR') + ' FCFA)');
-    res['_bpn_inclus'].forEach(lbl => nRow('☑  ' + lbl, 'FFF0FDFA'));
+  const _compo = opts.composition || res['_bpn_inclus'];
+  if (Array.isArray(_compo) && _compo.length) {
+    secHdr('Composition du bilan prénatal (forfait ' + ((opts.montant || r.montant || 20000)).toLocaleString('fr-FR') + ' FCFA)');
+    _compo.forEach(lbl => nRow('☑  ' + lbl, 'FFEDEDED'));
     row++;
   }
 
   // ✅ v12.4 — Examens demandés non encore renseignés → affichés vides à compléter
-  const pending = getPendingCheckedExams(r, r.type);
+  const pending = opts.pending || getPendingCheckedExams(r, r.type);
   if (pending.length) {
     secHdr('Examens demandés — résultats à compléter');
     pending.forEach(ex => {
@@ -811,6 +865,15 @@ function buildProfessionalSheet(wb, r, sheetName) {
     });
     row++;
   }
+
+  // ✅ v13.155 — Espaceur : une ligne vide dont la hauteur sera calculée à la fin
+  //   pour POUSSER le pied de page tout en bas de la feuille A4 (comme le modèle
+  //   PDF : contenu compact en haut, signature ancrée en bas). Les lignes de
+  //   résultats gardent leur taille normale (pas d'étirement).
+  row++;
+  const _spacerRow = row;
+  ws.getRow(row).height = 6;
+  row++;
 
   // ════════════════════════════════════════════════════
   // PIED DE PAGE
@@ -828,9 +891,10 @@ function buildProfessionalSheet(wb, r, sheetName) {
 
   mg(row,4,row,NC);
   const cMontant = ws.getCell(row,4);
-  if (r.montant) {
-    cMontant.value = 'Montant : ' + r.montant.toLocaleString('fr-FR') + ' FCFA';
-    sC(cMontant, {fg:'FF15803D', bold:true, size:9, ha:'right'});
+  const _montantAff = opts.montant || r.montant;
+  if (_montantAff) {
+    cMontant.value = 'Montant : ' + _montantAff.toLocaleString('fr-FR') + ' FCFA';
+    sC(cMontant, {fg:DARK, bold:true, size:9, ha:'right'});
   }
   row++; row++;
 
@@ -875,29 +939,25 @@ function buildProfessionalSheet(wb, r, sheetName) {
       + (_techName ? ('\nTECH: ' + _techName) : '')
   };
 
-  // ✅ v13.60 — Remplissage adaptatif, valable pour TOUS les onglets :
-  //   • Rapport COURT (tient sur une page) → on agrandit les lignes pour
-  //     remplir exactement UNE page A4 (aucun espace vide) et on la verrouille
-  //     sur une page (fitToHeight:1).
-  //   • Rapport LONG (dépasse une page) → on ne touche à rien : il garde sa
-  //     taille normale, lisible, et s'étale naturellement sur 2 pages
-  //     (fitToHeight:0). Concerne biochimie, bactériologie/ATB, immuno, hormones.
-  (function fillPage() {
+  // ✅ v13.155 — PIED DE PAGE ANCRÉ EN BAS (modèle PDF).
+  //   Les lignes de résultats gardent leur taille normale, lisible (pas
+  //   d'étirement). On mesure la hauteur totale du contenu + du pied de page,
+  //   puis on dilate UNIQUEMENT la ligne espaceur pour combler le vide restant
+  //   jusqu'au bas d'une page A4 → contenu compact en haut, signature en bas.
+  //     • Rapport court (NFS seule) → grand espaceur → pied de page en bas.
+  //     • Rapport long (bilan complet) → petit/zéro espaceur, tout tient sur
+  //       une page ; s'il déborde vraiment, il s'étale (fitToHeight:0).
+  (function anchorFooter() {
     const lastRow = row - 1;
-    if (lastRow < 3) return;
-    // ✅ v13.61 — TAILLE STANDARD FIXE (même densité pour tous les onglets).
-    //   On agrandit chaque ligne d'un facteur constant, calibré pour qu'un
-    //   rapport courant (NFS + Goutte épaisse) remplisse ~90 % d'une page A4.
-    //   • Rapport plus court (ex. CRP seule) : laisse un peu d'espace en bas.
-    //   • Rapport plus long (biochimie, ATB, immuno, hormones) : garde la même
-    //     taille de ligne et s'étale naturellement sur 2 pages.
-    const STD = (typeof window !== 'undefined' && window.__stdFactor) ? window.__stdFactor : 1.49;
-    for (let i = 1; i <= lastRow; i++) {
-      const rr = ws.getRow(i);
-      const h = (rr.height != null ? rr.height : 15);
-      rr.height = Math.round(h * STD * 10) / 10;
-    }
-    ws.pageSetup.fitToHeight = 0; // jamais de compression : long => 2 pages
+    if (lastRow < 3 || !_spacerRow) { ws.pageSetup.fitToHeight = 0; return; }
+    const getH = rr => (rr.height != null ? rr.height : 15);
+    let total = 0;
+    for (let i = 1; i <= lastRow; i++) total += getH(ws.getRow(i));
+    // Hauteur imprimable d'une page A4 (points). Réglable via window.__pageFill.
+    const PAGE = (typeof window !== 'undefined' && window.__pageFill) ? window.__pageFill : 756;
+    const deficit = PAGE - total;
+    if (deficit > 6) ws.getRow(_spacerRow).height = Math.round(deficit * 10) / 10;
+    ws.pageSetup.fitToHeight = 0; // jamais de compression
   })();
 }
 
@@ -920,7 +980,7 @@ let _tarifsRefCache = null;
 function getTarifsRef() {
   if (_tarifsRefCache) return _tarifsRefCache;
   try {
-    const local = JSON.parse(localStorage.getItem('v2_tarifs_ref') || 'null');
+    const local = JSON.parse(localStorage.getItem('tarifs_ref') || 'null');
     if (local) { _tarifsRefCache = local; return local; }
   } catch (e) { /* cache illisible : on repart des prix du catalogue */ }
   return buildTarifsRefDefault();
@@ -936,14 +996,14 @@ async function chargerTarifsDepuisBase() {
     const grille = Object.keys(data).length ? { ...buildTarifsRefDefault(), ...data }
                                             : buildTarifsRefDefault();
     _tarifsRefCache = grille;
-    try { localStorage.setItem('v2_tarifs_ref', JSON.stringify(grille)); } catch (e) {}
+    try { localStorage.setItem('tarifs_ref', JSON.stringify(grille)); } catch (e) {}
   } catch (e) { /* hors-ligne : le cache local prend le relais */ }
 }
 
 /** Enregistre la grille en base ; le cache local suit. */
 async function saveTarifsRef(t) {
   _tarifsRefCache = t;
-  try { localStorage.setItem('v2_tarifs_ref', JSON.stringify(t)); } catch (e) {}
+  try { localStorage.setItem('tarifs_ref', JSON.stringify(t)); } catch (e) {}
   if (typeof _sb === 'undefined' || !_sb) return;
   try {
     const { data, error } = await _sb.rpc('save_tarifs', { p_token: TK(), p_grille: t });
@@ -975,7 +1035,7 @@ let _examensCustomCache = null;
 function getExamensCustom() {
   if (_examensCustomCache) return _examensCustomCache;
   try {
-    const local = JSON.parse(localStorage.getItem('v2_examens_custom') || 'null');
+    const local = JSON.parse(localStorage.getItem('examens_custom') || 'null');
     if (Array.isArray(local)) { _examensCustomCache = local; return local; }
   } catch (e) { /* cache illisible */ }
   return [];
@@ -988,14 +1048,14 @@ async function chargerExamensCustomDepuisBase() {
     const { data, error } = await _sb.rpc('get_examens_custom', { p_token: TK() });
     if (error || !Array.isArray(data)) return;
     _examensCustomCache = data;
-    try { localStorage.setItem('v2_examens_custom', JSON.stringify(data)); } catch (e) {}
+    try { localStorage.setItem('examens_custom', JSON.stringify(data)); } catch (e) {}
     if (typeof rechargeFichePrix === 'function') rechargeFichePrix();
   } catch (e) { /* hors-ligne : le cache local prend le relais */ }
 }
 
 async function saveExamensCustom(list) {
   _examensCustomCache = list;
-  try { localStorage.setItem('v2_examens_custom', JSON.stringify(list)); } catch (e) {}
+  try { localStorage.setItem('examens_custom', JSON.stringify(list)); } catch (e) {}
   if (typeof _sb === 'undefined' || !_sb) return;
   try {
     const { data, error } = await _sb.rpc('save_examens_custom', { p_token: TK(), p_liste: list });
