@@ -283,10 +283,10 @@ function toggleDarkMode() {
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
   document.getElementById('btn-dark-mode').textContent = isDark ? '🌙' : '☀️';
-  localStorage.setItem('v2_labosaisie_theme', isDark ? 'light' : 'dark');
+  localStorage.setItem('labosaisie_theme', isDark ? 'light' : 'dark');
 }
 function initTheme() {
-  const saved = localStorage.getItem('v2_labosaisie_theme') || 'light';
+  const saved = localStorage.getItem('labosaisie_theme') || 'light';
   document.documentElement.setAttribute('data-theme', saved);
   const btn = document.getElementById('btn-dark-mode');
   if (btn) btn.textContent = saved === 'dark' ? '☀️' : '🌙';
@@ -311,7 +311,7 @@ function initTheme() {
 // end; $$;
 // grant execute on function public.set_dossier_statut(text,bigint,text) to anon;
 
-const STATUTS_KEY = 'v2_labosaisie_statuts';
+const STATUTS_KEY = 'labosaisie_statuts';
 function getStatuts() { try { return JSON.parse(localStorage.getItem(STATUTS_KEY)||'{}'); } catch { return {}; } }
 
 // Lit le statut depuis le cache DB (prioritaire) ou localStorage (fallback hors-ligne)
@@ -355,7 +355,7 @@ function setStatut(id, statut) {
 // Séparé du statut dossier (rendu/attente/urgent)
 // paiement_status : 'non_paye' | 'paye'
 // ════════════════════════════════════════════════════════
-const PAIEMENT_KEY = 'v2_labosaisie_paiements_v1';
+const PAIEMENT_KEY = 'labosaisie_paiements_v1';
 
 function getPaiements() {
   try { return JSON.parse(localStorage.getItem(PAIEMENT_KEY) || '{}'); } catch { return {}; }
@@ -377,10 +377,30 @@ function setPaiementStatus(id, status, infos) {
   localStorage.setItem(PAIEMENT_KEY, JSON.stringify(p));
   // Persister dans Supabase via p_patient update
   if (_sb && TK() && r) {
+    // ✅ v13.127 — Journée verrouillée : le serveur refuse ; on annule l'effet
+    // optimiste local et on prévient, au lieu de laisser croire à un paiement.
     Promise.resolve(_sb.rpc('update_dossier_patient', {
-      p_token: TK(), p_id: id,
-      p_patient: r.patient
-    })).catch(() => {});
+      p_token: TK(), p_id: id, p_patient: r.patient
+    })).then(res => {
+      if (res && res.error && typeof estJourVerrouille === 'function' && estJourVerrouille(res.error)) {
+        const prev = getPaiements(); delete prev[id]; localStorage.setItem(PAIEMENT_KEY, JSON.stringify(prev));
+        if (r) r.patient = { ...(r.patient || {}), paiement_status: 'non_paye' };
+        toast('🔒 Journée verrouillée — encaissement impossible', 'err');
+        if (typeof renderCaisse === 'function') renderCaisse();
+        if (typeof renderHistory === 'function') renderHistory();
+        return;
+      }
+      // ✅ v13.141 — Toute AUTRE erreur était avalée : le paiement restait
+      // « payé » dans le cache local de CE poste mais absent du serveur. Les
+      // autres postes voyaient « non payé » et refusaient d'enregistrer les
+      // résultats (valeurs perdues). On prévient désormais explicitement.
+      if (res && res.error) {
+        const prev = getPaiements(); delete prev[id]; localStorage.setItem(PAIEMENT_KEY, JSON.stringify(prev));
+        if (r) r.patient = { ...(r.patient || {}), paiement_status: 'non_paye' };
+        toast('⚠️ Encaissement non enregistré sur le serveur — refaites-le', 'err');
+        if (typeof renderCaisse === 'function') renderCaisse();
+      }
+    }).catch(() => { toast('⚠️ Encaissement non confirmé par le serveur — vérifiez la connexion', 'err'); });
   }
   updateBandeauPaiement();
   if (typeof renderCaisse === 'function') renderCaisse();
@@ -390,6 +410,22 @@ function setPaiementStatus(id, status, infos) {
 function isDossierPaye(id) {
   return getPaiementStatus(id) === 'paye';
 }
+
+// ✅ v13.94 — Un résultat non payé ne sort pas du laboratoire.
+// La v13.35 empêchait déjà de SAISIR un résultat non encaissé ; rien
+// n'empêchait de l'imprimer ou de l'exporter. Le garde est ici, en un seul
+// endroit, et non recopié dans chaque bouton : c'est la seule façon de ne
+// pas en oublier un au prochain point d'entrée.
+// L'administrateur reste libre — c'est lui qui accorde les gratuités et qui
+// doit pouvoir sortir un duplicata en cas de litige.
+function sortieAutorisee(id) {
+  if (typeof isAdmin === 'function' && isAdmin()) return true;
+  if (typeof isDossierPaye !== 'function') return true;   // module absent : on ne bloque pas
+  if (isDossierPaye(id)) return true;
+  toast('🔒 Dossier non encaissé — impression et export bloqués', 'err');
+  return false;
+}
+
 
 // Met à jour le bandeau rouge en vue saisie selon le dossier en cours
 function updateBandeauPaiement() {
@@ -1219,20 +1255,24 @@ async function submitFirstLoginPassword() {
 }
 
 // ── FEATURE 5 : tableau de bord Caisse ────────────────────────────
-let _caissePeriode = 'jour';
+// ✅ v13.108 — Défaut aligné sur les autres vues (« ce mois ») : la période
+// est désormais commune à l'Historique, la Caisse et les Statistiques.
+let _caissePeriode = 'mois';
 let _caisseChart = null;
 // ✅ v13.73 — décalage temporel de la Caisse (voir js/periode-nav.js)
 let _caisseDecalage = 0;
 
 function setCaissePeriode(p, garderDecalage) {
-  if (!garderDecalage) _caisseDecalage = 0;
-  _caissePeriode = p;
-  ['jour','semaine','mois'].forEach(k => {
-    const b = document.getElementById('caisse-btn-' + k);
-    if (b) b.classList.toggle('active', k === p);
-  });
-  if (p !== 'custom') synchroniserChampsDate('caisse', p, _caisseDecalage);
-  majBandeauPeriode('caisse', _caissePeriode, _caisseDecalage);
+  // ✅ v13.108 — Période commune aux trois vues. Pour une plage libre, on lit
+  // les champs de dates de la Caisse et on les propage aux autres onglets.
+  if (p === 'custom') {
+    const from = document.getElementById('caisse-date-from')?.value || '';
+    const to   = document.getElementById('caisse-date-to')?.value   || '';
+    appliquerPeriodePartout('custom', 0, from, to);
+  } else {
+    const dec = garderDecalage ? _caisseDecalage : 0;
+    appliquerPeriodePartout(p, dec);
+  }
   renderCaisse();
 }
 
@@ -1263,13 +1303,17 @@ function getCaisseRange() {
       to:   document.getElementById('caisse-date-to')?.value || '',
     };
   }
-  return calcPlagePeriode(_caissePeriode || 'jour', _caisseDecalage);
+  // ✅ v13.108 — La Caisse peut désormais recevoir « tout » (période commune) :
+  // aucune borne de date, on montre l'ensemble.
+  if (_caissePeriode === 'tout') return { from: '', to: '' };
+  return calcPlagePeriode(_caissePeriode || 'mois', _caisseDecalage);
 }
 async function renderCaisse() {
   await refreshDB();
   updateVerrouilleeBtn(); // ✅ v13.32 — bouton admin fiches verrouillées
   // ✅ v13.33 — Brancher selon le rôle : agent → vue simplifiée, admin/caissier → caisse complète
-  if (!isAdmin() && !isCaissier() && !isSpectateur()) {
+  // ✅ v13.122 — Sauf si l'agent fait la caisse (aucun caissier) → caisse complète.
+  if (!isAdmin() && !isCaissier() && !isSpectateur() && !(typeof peutEncaisser === 'function' && peutEncaisser())) {
     // La clôture est un document de caisse : elle n'a rien à faire dans la
     // vue simplifiée d'un agent, qui ne tient pas le tiroir.
     const carte = document.getElementById('cloture-card');
@@ -1527,7 +1571,7 @@ function renderUserCaisse() {
 }
 
 // ── FEATURE 6 : ristournes mensuelles + export PDF/Excel ──────────
-const RISTOURNE_TAUX_KEY = 'v2_ristourne_taux_override';
+const RISTOURNE_TAUX_KEY = 'ristourne_taux_override';
 function getRistourneOverrides() { try { return JSON.parse(localStorage.getItem(RISTOURNE_TAUX_KEY) || '{}'); } catch (e) { return {}; } }
 function tauxFor(presc) {
   // ✅ v13.29 — priorité à la valeur en base (_prescripteurs déjà chargé depuis DB)
