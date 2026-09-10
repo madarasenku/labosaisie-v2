@@ -7,7 +7,7 @@
    ═══════════════════════════════════════════════════════════════ */
 
 (function checkAuth() {
-  const SESSION_KEY_CHECK = 'v2_labo_session_user';
+  const SESSION_KEY_CHECK = 'labo_session_user';
   const raw = localStorage.getItem(SESSION_KEY_CHECK);
   if (!raw) { window.location.replace('login.html'); return; }
   try {
@@ -19,13 +19,8 @@
   } catch(e) { window.location.replace('login.html'); }
 })();
 
-// ⚠️ SITE SECONDAIRE (labosaisie-v2) — base Supabase DISTINCTE de la
-// production. Rien de ce qui est saisi ici n'apparaît sur le site principal,
-// et inversement. Le bandeau orange en haut de l'écran le rappelle en
-// permanence : sans lui, un agent pressé saisirait une journée entière
-// dans la mauvaise base sans jamais s'en apercevoir.
-const SUPABASE_URL = 'https://ftwsxdivwoczsreiohok.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_de9EPaXmi3QSXMqSSoGuKg_kwWw9Yth';
+const SUPABASE_URL = 'https://uvxxbihlagfncraokqlg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_RPgz6piVcNONZOOcLmOCQw_5YPxZTd6';
 
 // ── URL publique de l'application (pour les QR codes de vérification) ──
 // Remplacez par votre propre URL si vous hébergez l'app (GitHub Pages, Netlify…)
@@ -64,6 +59,14 @@ let _filterCorbeille = false;
 // de la vue normale pour tout le monde, y compris leur propriétaire).
 let _filterVerrouillees = false;
 
+// ✅ v13.128 — Jour d'un dossier verrouillé ? (pour la vue spectateur)
+function _jourDeDossier(r) {
+  return (r.patient && r.patient.date) || String(r.savedAt || r.created_at || r.createdAt || '').slice(0, 10);
+}
+function _jourDossierVerrouille(r) {
+  return (typeof jourVerrouille === 'function') && jourVerrouille(_jourDeDossier(r));
+}
+
 function getDB() {
   // ✅ v13.33 — Corbeille : admin voit soft+hard deleted, agent voit ses soft-delete
   if (_filterCorbeille) {
@@ -84,14 +87,29 @@ function getDB() {
   // caissier ne pouvait plus encaisser la patiente. Un dossier qu'on ne voit
   // pas est un dossier qu'on ne peut pas traiter.
   //
-  // Admin/Caissier/Spectateur : fiches actives (sans soft-delete ni hard-delete ni masquées)
-  if (isAdmin() || isCaissier() || isSpectateur())
+  // ✅ v13.128 — Le SPECTATEUR ne voit QUE les journées verrouillées.
+  if (isSpectateur())
+    return _dbCache.filter(r => !r.deletedAt && !r._hardDeleted && !r.restrictedBy && _jourDossierVerrouille(r));
+  // Admin/Caissier : fiches actives (sans soft-delete ni hard-delete ni masquées)
+  if (isAdmin() || isCaissier())
     return _dbCache.filter(r => !r.deletedAt && !r._hardDeleted && !r.restrictedBy);
   // Agent : ses fiches actives uniquement
   const uid = _currentUser?.username;
   if (!uid) return [];
   return _dbCache.filter(r => !r.deletedAt && !r._hardDeleted && !r.restrictedBy
                               && r.createdBy === uid);
+}
+
+// ✅ v13.150 — Retrouve un dossier pour l'IMPRESSION / EXPORT, y compris s'il est
+// MASQUÉ (getDB() l'exclut). Accessible à l'admin, au créateur et à celui qui l'a
+// masqué. Permet d'imprimer/exporter un compte rendu depuis une fiche masquée.
+function recordForOutput(id) {
+  let r = getDB().find(x => x.id === id);
+  if (r) return r;
+  const uid = _currentUser?.username;
+  const admin = (typeof isAdmin === 'function') && isAdmin();
+  return _dbCache.find(x => x.id === id && !x.deletedAt && !x._hardDeleted && x.restrictedBy
+                            && (admin || x.createdBy === uid || x.restrictedBy === uid)) || null;
 }
 
 /**
@@ -237,7 +255,9 @@ function getCalcDB() {
   // Base de calcul : Caisse, Statistiques, Ristournes, rapport PDF.
   // Une seule règle décide de l'exclusion : isExcludedFromCalc.
   const vivante = r => !r.deletedAt && !r._hardDeleted && !isExcludedFromCalc(r);
-  if (isAdmin() || isCaissier() || isSpectateur()) return _dbCache.filter(vivante);
+  // ✅ v13.128 — Le spectateur ne calcule que sur les journées verrouillées.
+  if (isSpectateur()) return _dbCache.filter(r => vivante(r) && _jourDossierVerrouille(r));
+  if (isAdmin() || isCaissier()) return _dbCache.filter(vivante);
   const uid = _currentUser?.username;
   if (!uid) return [];
   return _dbCache.filter(r => vivante(r) && r.createdBy === uid);
@@ -339,6 +359,10 @@ async function refreshDB(force) {
     }
   } catch (e) { /* RPC absent — on garde la valeur courante */ }
 
+  // ✅ v13.128 — Rafraîchir la liste des journées verrouillées (le spectateur
+  // ne voit que celles-ci ; les autres profils en ont besoin pour l'affichage).
+  try { if (typeof chargerClotures === 'function') await chargerClotures(); } catch (e) {}
+
   return _dbCache;
 }
 
@@ -350,8 +374,16 @@ async function ensureFull(record) {
   if (!navigator.onLine) return record;
   try {
     const { data, error } = await _sb.rpc('get_resultat_full', { p_token: TK(), p_id: record.id });
-    if (error || !data) return record;
-    record.resultats = data.resultats || {};
+    // ✅ v13.142 — CORRECTIF MAJEUR. get_resultat_full est déclarée
+    // « RETURNS SETOF labo_resultats » : supabase renvoie donc un TABLEAU de
+    // lignes. L'ancien code lisait data.resultats sur ce tableau — toujours
+    // undefined — et écrasait record.resultats par {} tout en marquant la fiche
+    // « complète ». Conséquence : le dossier perdait _examens_coches et ses
+    // résultats EN MÉMOIRE. D'où « 0 patient enregistré · 1 erreur » en série,
+    // une saisie simple qui n'enregistrait rien, et des impressions vides.
+    const row = Array.isArray(data) ? data[0] : data;
+    if (error || !row) return record;          // ne JAMAIS vider en cas d'échec
+    record.resultats = row.resultats || {};
     record._light = false;
     const idx = _dbCache.findIndex(r => r.id === record.id);
     if (idx >= 0) { _dbCache[idx].resultats = record.resultats; _dbCache[idx]._light = false; }
@@ -391,7 +423,7 @@ async function refreshDBFull() {
 //   (cache) et est conservé tel quel à la synchro ; en cas de saisies
 //   simultanées sur plusieurs postes hors-ligne, vérifiez l'unicité.
 // ══════════════════════════════════════════════════════════════
-const SYNC_QUEUE_KEY = 'v2_labo_sync_queue';
+const SYNC_QUEUE_KEY = 'labo_sync_queue';
 let _syncing = false;
 
 function loadSyncQueue() {
@@ -539,7 +571,7 @@ async function flushSyncQueue(silent) {
 
 async function insertRecordRemote(record) {
   // ✅ v13 — insertion via RPC sécurisée par jeton
-  const est_bpn = record.type === 'Bilan prénatal' || (record.resultats?._types||[]).includes('Bilan prénatal');
+  const est_bpn = estDossierBPN(record);
   if (!navigator.onLine) return enqueueInsert(record, est_bpn); // ✅ v13.4 — hors-ligne connu
   try {
     const { data, error } = await _sb.rpc('insert_resultat', {
@@ -562,17 +594,40 @@ async function insertRecordRemote(record) {
     return saved;
   } catch (e) {
     if (isNetworkError(e)) return enqueueInsert(record, est_bpn); // ✅ v13.4 — bascule en file
+    if (estJourVerrouille(e)) { toast('🔒 Journée verrouillée — enregistrement impossible', 'err'); return null; }
     console.error('Erreur insertion Supabase:', e);
     toast("Échec de l'enregistrement distant", 'err');
     return null;
   }
 }
 
+// ✅ v13.127 — Détecte l'erreur du garde-fou « journée verrouillée » (trigger DB).
+function estJourVerrouille(e) {
+  const m = (e && (e.message || e.error_description || e.details)) || (typeof e === 'string' ? e : '');
+  return /journee_verrouillee/i.test(String(m));
+}
+
 // Met à jour une fiche existante (édition depuis l'historique)
+// ✅ v13.144 — Le forfait prénatal est désormais un EXAMEN du catalogue
+// (« Bilan prénatal complet (forfait) », onglet Hématologie) et non plus un
+// type d'analyse : le test historique sur type/_types renvoyait donc false pour
+// TOUS les bilans prénatals (74 dossiers en base, aucun marqué). On reconnaît
+// le forfait à son libellé parmi les examens cochés.
+function estDossierBPN(record) {
+  if (!record) return false;
+  if (record.type === 'Bilan prénatal') return true;
+  const res = record.resultats || {};
+  if ((res._types || []).includes('Bilan prénatal')) return true;
+  const coches = res._examens_coches || {};
+  const labels = Array.isArray(coches) ? coches
+    : Object.values(coches).reduce((a, v) => a.concat(v || []), []);
+  return labels.some(l => /pr[ée]natal/i.test(String(l)));
+}
+
 async function updateRecordRemote(id, record, opts = {}) {
   // ✅ v13.34 — opts.onlyPatient : ne met à jour que les infos patient (pas résultats ni montant)
   // opts.onlyResultats : ne met à jour que les résultats (montant gelé au cache)
-  const est_bpn = record.type === 'Bilan prénatal' || (record.resultats?._types||[]).includes('Bilan prénatal');
+  const est_bpn = estDossierBPN(record);
   if (!navigator.onLine || String(id).startsWith('tmp_')) return enqueueUpdate(id, record, est_bpn);
 
   // Construire le payload selon ce qu'on modifie
@@ -583,11 +638,13 @@ async function updateRecordRemote(id, record, opts = {}) {
   }
   if (!opts.onlyPatient) {
     payload.p_resultats = record.resultats;
-    // ✅ Montant gelé si on modifie uniquement les résultats
-    const cachedRecord = _dbCache.find(r => r.id === id);
-    payload.p_montant = opts.onlyResultats
-      ? (cachedRecord?.montant || record.montant || 0)
-      : (record.montant || 0);
+    // ✅ v13.146 — CORRECTION DES RÉSULTATS SUR JOURNÉE VERROUILLÉE.
+    // En mode « résultats seuls » on n'envoie PLUS de montant : le RPC fait
+    // coalesce(NULL, montant) = montant inchangé, donc le garde-fou « argent »
+    // du trigger ne peut plus se déclencher et la correction passe toujours.
+    if (!opts.onlyResultats) {
+      payload.p_montant = record.montant || 0;
+    }
   } else {
     // onlyPatient : garder montant et résultats existants
     const cachedRecord = _dbCache.find(r => r.id === id);
@@ -611,6 +668,7 @@ async function updateRecordRemote(id, record, opts = {}) {
     return updated;
   } catch (e) {
     if (isNetworkError(e)) return enqueueUpdate(id, record, est_bpn); // ✅ v13.4
+    if (estJourVerrouille(e)) { toast('🔒 Journée verrouillée — modification impossible', 'err'); return null; }
     console.error('Erreur mise à jour Supabase:', e);
     toast('Échec de la mise à jour', 'err');
     return null;
@@ -770,6 +828,15 @@ async function resetFicheIdentif() {
   _editingFicheId  = null; // ✅ v13.29
   _locksDisabled = false;
   _shareTokenCurrent = null; // Nouveau patient → nouveau token de partage
+  // ✅ v13.114 — Sortir du mode « tout sur une page » (nouvelle saisie) et
+  // restaurer l'affichage normal par onglets + les boutons par onglet.
+  if (typeof _fillAllMode !== 'undefined') _fillAllMode = false;
+  document.body.classList.remove('fill-all-mode');
+  document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = '');
+  // Ré-afficher les lignes masquées par hideUncheckedExamRows() (fill-all).
+  document.querySelectorAll('#zone-saisie tr, #zone-saisie .abg-row').forEach(row => { row.style.display = ''; });
+  // ✅ v13.117 — Cacher le bouton « Enregistrer + Imprimer » hors vue empilée.
+  { const pb = document.getElementById('btn-save-print'); if (pb) pb.style.display = 'none'; }
 
   const banner = document.getElementById('edit-mode-banner');
   if (banner) banner.style.display = 'none';
@@ -803,6 +870,8 @@ async function resetFicheIdentif() {
     const chk = document.getElementById(ex.id);
     if (chk) chk.checked = false;
   });
+  // ✅ v13.125 — Réinitialiser la case « réception seule » pour le patient suivant.
+  { const rs = document.getElementById('chk-reception-seule'); if (rs) rs.checked = false; }
   calcFicheTotal();
   // Revenir à la fiche d'identification si on est en zone saisie
   const zoneSaisie = document.getElementById('zone-saisie');
@@ -1174,7 +1243,10 @@ async function _saveRecordImpl(type) {
   if (!validatePatient(p)) return;
   // ✅ v13.35 — Bloquer la saisie si dossier non payé
   if (_editingRecordId && !isDossierPaye(_editingRecordId)) {
-    toast('🔒 Paiement requis avant la saisie des résultats', 'err');
+    // ✅ v13.103 — La saisie est libre depuis la v13.98 ; c'est l'ENREGISTREMENT
+    // qui exige le paiement. Le message d'avant parlait encore de la saisie et
+    // laissait croire à un blocage qui n'existe plus.
+    toast('🔒 Paiement requis avant d\'enregistrer ce dossier', 'err');
     showView('caisse');
     return;
   }
@@ -1452,6 +1524,7 @@ function resetPanelAfterSave(tabKey) {
 // ============================================================
 
 let _editingRecordId = null;
+let _fillAllMode = false; // ✅ v13.112 — édition « remplir tout sur une page »
 let _editingType     = null; // type de l'analyse en cours d'édition
 let _editingFicheId  = null; // ✅ v13.29 — id du dossier en cours de modification fiche d'accueil
 let _selectedIds     = new Set(); // ✅ v13.30 — IDs sélectionnés pour actions en masse
@@ -1481,14 +1554,12 @@ async function editRecord(id, typeOverride) {
   }
   if (!record) { toast('Fiche introuvable', 'err'); return; }
 
-  // Pour un dossier multi-analyses : demander quel onglet modifier
+  // ✅ v13.112 — Dossier (une ou plusieurs analyses) : on remplit TOUT sur une
+  // seule page (toutes les sections cochées empilées) et l'enregistrement route
+  // chaque résultat vers sa bonne analyse. Fini le choix « quelle analyse ? »
+  // et l'onglet unique qui cachait CRP quand on éditait l'Hématologie.
   if (isDossierRecord(record) && !typeOverride) {
-    const types = getRecordTypes(record);
-    if (types.length > 1) {
-      showEditTypeModal(id, types);
-      return;
-    }
-    typeOverride = types[0] || 'Hématologie';
+    return fillAllResults(id);
   }
 
   const type      = typeOverride || record.type || 'Hématologie';
@@ -1579,6 +1650,310 @@ async function editRecord(id, typeOverride) {
   toast('Fiche chargée pour modification (' + type + ')', 'ok');
 }
 
+// ✅ v13.112 — Ouvrir une fiche à compléter avec TOUTES les analyses cochées
+// empilées sur une seule page. Un unique bouton d'enregistrement route chaque
+// résultat vers sa bonne analyse (voir saveRecordAll).
+async function fillAllResults(id) {
+  if (isCaissier() || isSpectateur()) { toast('Accès lecture seule — modification impossible', 'err'); return; }
+  let record = getDB().find(x => x.id === id);
+  if (!record) { await refreshDB(); record = getDB().find(x => x.id === id); }
+  if (!record) { toast('Fiche introuvable', 'err'); return; }
+  await ensureFull(record);
+
+  const types = getRecordTypes(record);
+  _editingRecordId   = id;
+  _editingType       = null;
+  _fillAllMode       = true;
+  _shareTokenCurrent = record.patient?.share_token || null;
+
+  showView('saisie');
+  await new Promise(r => setTimeout(r, 50));
+
+  // Patient
+  const p = record.patient || {};
+  const setVal = (eid, val) => { const el = document.getElementById(eid); if (el) el.value = val || ''; };
+  setVal('p_dossier', p.dossier); setVal('p_date', p.date); setVal('p_nom', p.nom);
+  setVal('p_age', p.age); setVal('p_sexe', p.sexe); setVal('p_medecin', p.medecin);
+  setVal('p_service', p.service); setVal('p_clinique', p.clinique);
+  if (p.sexe || p.age) updateAllRefs();
+  const prescEl = document.getElementById('p_prescripteur_id');
+  if (prescEl && record.prescripteur_id) prescEl.value = record.prescripteur_id;
+
+  document.getElementById('fiche-identification').style.display = 'none';
+  document.getElementById('zone-saisie').style.display = '';
+  document.body.classList.add('fill-all-mode');
+
+  // Construire tous les panneaux, puis charger les résultats de chaque analyse
+  TAB_ORDER.forEach(t => { try { ensurePanelBuilt(t); } catch (e) {} });
+  await new Promise(r => setTimeout(r, 100));
+  types.forEach(t => { const rr = getRecordResultats(record, t); if (rr) loadResultsIntoForm(t, rr); });
+  types.forEach(t => { try { ensureInterpFresh(t); } catch (e) {} });
+
+  // Montant gelé (comme en édition simple)
+  const montantOriginal = record.montant || 0;
+  const montantEl = document.getElementById('montant-preview');
+  if (montantEl) {
+    montantEl.dataset.montantGele = montantOriginal;
+    montantEl.textContent = montantOriginal.toLocaleString('fr-FR') + ' F';
+  }
+  window._updateMontantCurrent_orig = window.updateMontantCurrent;
+  window.updateMontantCurrent = function () {
+    if (_editingRecordId) return;
+    window._updateMontantCurrent_orig && window._updateMontantCurrent_orig();
+  };
+
+  // Restaurer les cases cochées de TOUTES les analyses + appliquer les verrous
+  _locksDisabled = false;
+  const _cochesRestaurees = (typeof restoreFicheFromRecord === 'function')
+    ? restoreFicheFromRecord(record) : false;
+  // ✅ v13.135 — Dossier sans info d'examens cochés (ancien format ou corrompu par
+  // une saisie série d'une version antérieure) : mode RÉCUPÉRATION. On déverrouille
+  // tout, on reconstruit les cases depuis les résultats déjà présents, et on révèle
+  // TOUS les panneaux pour que l'utilisateur puisse compléter/corriger puis
+  // ré-enregistrer (ce qui reconstruit « _examens_coches »).
+  const _modeRecuperation = !_cochesRestaurees;
+  if (_modeRecuperation) {
+    _locksDisabled = true;
+    if (typeof reconstruireCochesDepuisForm === 'function') reconstruireCochesDepuisForm();
+  }
+  if (typeof applyExamLocks === 'function') applyExamLocks();
+
+  // Révéler les panneaux : par défaut ceux qui ont au moins un examen coché ;
+  // en mode récupération, TOUS (pour permettre de ré-ajouter un examen perdu).
+  TAB_ORDER.forEach(tid => {
+    const panel = document.getElementById('panel-' + tid);
+    if (!panel) return;
+    if (_modeRecuperation) { panel.classList.add('active'); return; }
+    const anyChecked = getCatalogueComplet().filter(ex => ex.tab === tid)
+      .some(ex => document.getElementById(ex.id)?.checked);
+    panel.classList.toggle('active', anyChecked);
+  });
+
+  if (typeof markRequiredSections === 'function') markRequiredSections();
+  // ✅ v13.114 — Masquer aussi les lignes des examens non cochés dans les cartes
+  // partagées (cohérent avec la nouvelle saisie « tout sur une page »).
+  // ✅ v13.135 — En mode récupération, on laisse TOUTES les lignes visibles pour
+  // que l'utilisateur puisse ré-ajouter un examen dont l'info avait été perdue.
+  if (!_modeRecuperation && typeof hideUncheckedExamRows === 'function') hideUncheckedExamRows();
+
+  // Boutons : masquer les « Enregistrer » par onglet, montrer le bouton unique
+  document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = 'none');
+  const btnAll = document.getElementById('btn-save-all');
+  if (btnAll) { btnAll.style.display = 'inline-flex'; btnAll.innerHTML = '💾 Enregistrer les résultats'; }
+
+  // Bandeau
+  let banner = document.getElementById('edit-mode-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'edit-mode-banner';
+    banner.style.cssText = 'background:#fef3c7;border:1.5px solid #d97706;color:#92400e;padding:10px 16px;border-radius:var(--radius);margin-bottom:14px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:10px';
+    document.getElementById('rappel-patient')?.parentNode?.insertBefore(banner, document.getElementById('rappel-patient'));
+  }
+  banner.innerHTML = '✏️ Compléter les résultats — Dossier N°' + esc(p.dossier || '') + ' · ' + esc(p.nom || '')
+    + ' <span style="font-size:11px;font-weight:400;opacity:.7">(' + esc(types.join(', ')) + ')</span>'
+    + ' <button onclick="cancelEdit()" style="margin-left:auto;background:none;border:1px solid #92400e;color:#92400e;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600">Annuler</button>';
+  banner.style.display = 'flex';
+
+  const rappelNom = document.getElementById('rappel-nom');
+  const rappelDoss = document.getElementById('rappel-dossier');
+  if (rappelNom)  rappelNom.textContent  = (p.nom || '').toUpperCase();
+  if (rappelDoss) rappelDoss.textContent = 'N° ' + (p.dossier || '');
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  toast('Fiche chargée — remplissez tous les examens puis « Enregistrer les résultats »', 'ok');
+}
+
+// ✅ v13.112 — Enregistrement atomique de TOUTES les analyses en un seul appel.
+// Route chaque résultat vers sa bonne analyse ; ne réinitialise pas
+// _editingRecordId en cours de route (contrairement à une boucle sur
+// _saveRecordImpl, qui créerait des doublons dès la 2ᵉ analyse).
+async function saveRecordAll() {
+  const p = getPatient();
+  if (!validatePatient(p)) return;
+  // ✅ v13.114 — Nouvelle saisie « tout sur une page » (aucun dossier existant) :
+  // création atomique d'un seul dossier avec TOUTES les analyses cochées.
+  if (!_editingRecordId) { return saveRecordAllFresh(); }
+  // ✅ v13.141 — CORRECTIF « les valeurs s'évaporent ».
+  // Le statut de paiement était lu depuis un cache local (localStorage), donc
+  // PROPRE À CHAQUE POSTE : la caisse encaissait sur son ordinateur, le poste de
+  // saisie continuait de voir « non payé », refusait l'enregistrement et
+  // basculait vers la caisse — les résultats tapés étaient perdus.
+  // Désormais : on revérifie auprès du SERVEUR avant de bloquer, et surtout on
+  // ne quitte JAMAIS la vue de saisie (les valeurs restent à l'écran).
+  if (_editingRecordId && !isDossierPaye(_editingRecordId)) {
+    try { await refreshDB(true); } catch (e) {}
+  }
+  if (_editingRecordId && !isDossierPaye(_editingRecordId)) {
+    let allerCaisse = false;
+    if (typeof showConfirmModal === 'function') {
+      allerCaisse = await showConfirmModal({
+        icon: '🔒', title: 'Paiement requis',
+        message: 'Ce dossier n\'est pas encore encaissé, l\'enregistrement est donc refusé.'
+          + '<br><br><strong>Vos résultats saisis sont conservés à l\'écran.</strong> '
+          + 'Encaissez le dossier, puis revenez ici et cliquez de nouveau sur « Enregistrer ».',
+        confirmText: 'Aller à la caisse', cancelText: 'Rester sur la saisie'
+      });
+    } else {
+      toast('🔒 Paiement requis — vos saisies sont conservées', 'err');
+    }
+    if (allerCaisse) showView('caisse');
+    return;
+  }
+  showLoading('Enregistrement…');
+  try {
+    const existing = getDB().find(rr => rr.id === _editingRecordId);
+    if (!existing) { hideLoading(); toast('Fiche introuvable', 'err'); return; }
+
+    const TT = { hema:'Hématologie', bio:'Biochimie', bacterio:'Bactériologie',
+                 sero:'Immuno-Sérologie', parasito:'Parasitologie', gs:'Groupe sanguin' };
+    const base = existing.resultats || {};
+    const newRes = { ...base };
+    newRes._types          = Array.isArray(base._types) ? [...base._types] : [];
+    newRes._examens_coches = { ...(base._examens_coches || {}) };
+    newRes._examens_prix   = { ...(base._examens_prix   || {}) };
+    newRes._montants       = { ...(base._montants       || {}) };
+    const montantParTab = JSON.parse(document.getElementById('montant-preview')?.dataset?.montantParTab || '{}');
+    let anyCritical = false;
+
+    TAB_ORDER.forEach(tid => {
+      const type = TT[tid];
+      if (!type) return;
+      const coches = getCatalogueComplet().filter(ex => ex.tab === tid && document.getElementById(ex.id)?.checked);
+      if (!coches.length) return;                  // analyse non demandée → on n'y touche pas
+      try { ensureInterpFresh(type); } catch (e) {}
+      const tr = collectResults(type);
+      try { if (checkValeursCritiques(tr).length) anyCritical = true; } catch (e) {}
+      newRes[type] = tr;
+      if (!newRes._types.includes(type)) newRes._types.push(type);
+      newRes._examens_coches[type] = coches.map(ex => ex.label);
+      const prix = {};
+      coches.forEach(ex => { const px = document.getElementById('px_' + ex.id); prix[ex.label] = px ? (parseInt(px.value || '0') || 0) : (ex.prix || 0); });
+      newRes._examens_prix[type] = prix;
+      if (newRes._montants[type] == null) newRes._montants[type] = montantParTab[tid] || 0;
+    });
+
+    newRes._facture_seule = false;                 // des résultats ont été saisis
+    if (anyCritical) p.has_critical = true;
+    // Montant gelé : on conserve le total facturé du dossier
+    const newMontant = existing.montant || Object.values(newRes._montants).reduce((s, m) => s + (Number(m) || 0), 0);
+
+    const saved = await updateRecordRemote(_editingRecordId, {
+      patient: p, type: 'Dossier', resultats: newRes, montant: newMontant,
+      prescripteur_id: (document.getElementById('p_prescripteur_id')?.value) || existing.prescripteur_id || null,
+    }, { onlyResultats: true });
+
+    if (saved) {
+      _editingRecordId = null; _editingType = null; _fillAllMode = false;
+      if (window._updateMontantCurrent_orig) { window.updateMontantCurrent = window._updateMontantCurrent_orig; window._updateMontantCurrent_orig = null; }
+      document.body.classList.remove('fill-all-mode');
+      document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = '');
+      hideLoading();
+      toast('✅ Résultats enregistrés', 'ok');
+      await refreshDB(true);
+      // ✅ v13.141 — Paillasse supprimée : on revient simplement à l'historique.
+      showView('historique');
+    } else {
+      hideLoading();
+    }
+  } catch (e) {
+    hideLoading();
+    toast('Erreur : ' + (e.message || e), 'err');
+  }
+}
+
+// ✅ v13.114 — Enregistrement atomique d'une NOUVELLE saisie « tout sur une page ».
+// Crée UN seul dossier contenant toutes les analyses cochées + leurs résultats,
+// en un unique insert. Évite l'ancien parcours saveAllTabs → boucle de
+// _saveRecordImpl, qui régénérait le numéro de dossier entre chaque analyse et
+// pouvait éclater un même patient en plusieurs dossiers.
+async function saveRecordAllFresh() {
+  const p = getPatient();
+  if (!validatePatient(p)) return;
+
+  const TT = { hema:'Hématologie', bio:'Biochimie', bacterio:'Bactériologie',
+               sero:'Immuno-Sérologie', parasito:'Parasitologie', gs:'Groupe sanguin' };
+
+  // Vérifier qu'au moins un examen est coché.
+  const tabsCoches = TAB_ORDER.filter(tid => TT[tid] &&
+    getCatalogueComplet().some(ex => ex.tab === tid && document.getElementById(ex.id)?.checked));
+  if (!tabsCoches.length) { toast('⚠ Aucun examen coché', 'err'); return; }
+
+  showLoading('Enregistrement…');
+  try {
+    // Anti-doublon : fermer la fenêtre entre l'aperçu du numéro et l'écriture.
+    let cacheComplet;
+    try { cacheComplet = await refreshDB(true); }
+    catch (e) { cacheComplet = (typeof getDB === 'function' ? getDB() : []); }
+    const dup = (cacheComplet || []).find(rr =>
+      rr.patient?.dossier === p.dossier && !rr.deletedAt && !rr._hardDeleted);
+    if (dup) {
+      hideLoading();
+      const ok = await showConfirmModal({
+        icon: '⚠️', title: 'Numéro de dossier déjà utilisé',
+        message: 'Le dossier N° ' + esc(p.dossier || '') + ' existe déjà (' + esc(dup.patient?.nom || '') + '). Générer un nouveau numéro et enregistrer ? (Annuler pour vérifier d\'abord.)',
+        confirmText: 'Nouveau numéro + enregistrer', cancelText: 'Annuler'
+      });
+      if (!ok) return;
+      await regenDossier();
+      p.dossier = getPatient().dossier;
+      showLoading('Enregistrement…');
+    }
+
+    const montantParTab = JSON.parse(document.getElementById('montant-preview')?.dataset?.montantParTab || '{}');
+    const newRes = { _types: [], _montants: {}, _examens_coches: {}, _examens_prix: {}, _facture_seule: false };
+    let anyCritical = false;
+
+    TAB_ORDER.forEach(tid => {
+      const type = TT[tid];
+      if (!type) return;
+      const coches = getCatalogueComplet().filter(ex => ex.tab === tid && document.getElementById(ex.id)?.checked);
+      if (!coches.length) return;                    // analyse non demandée
+      try { ensureInterpFresh(type); } catch (e) {}
+      const tr = collectResults(type);
+      try { if (checkValeursCritiques(tr).length) anyCritical = true; } catch (e) {}
+      newRes[type] = tr;
+      newRes._types.push(type);
+      newRes._examens_coches[type] = coches.map(ex => ex.label);
+      const prix = {};
+      coches.forEach(ex => { const px = document.getElementById('px_' + ex.id); prix[ex.label] = px ? (parseInt(px.value || '0') || 0) : (ex.prix || 0); });
+      newRes._examens_prix[type] = prix;
+      newRes._montants[type] = montantParTab[tid] || Object.values(prix).reduce((s, v) => s + (Number(v) || 0), 0);
+    });
+
+    if (anyCritical) p.has_critical = true;
+    const montant = Object.values(newRes._montants).reduce((s, m) => s + (Number(m) || 0), 0);
+    const prescripteurId = document.getElementById('p_prescripteur_id')?.value || null;
+
+    const saved = await insertRecordRemote({
+      patient: p, type: 'Dossier', resultats: newRes, montant,
+      prescripteur_id: prescripteurId || null,
+    });
+
+    if (saved) {
+      _fillAllMode = false;
+      _editingRecordId = null; _editingType = null;
+      document.body.classList.remove('fill-all-mode');
+      document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = '');
+      hideLoading();
+      toast('✅ Dossier N°' + (p.dossier || '') + ' enregistré — ' + montant.toLocaleString('fr-FR') + ' FCFA', 'ok');
+      await refreshDB(true);
+      // ✅ v13.117 — « Enregistrer + Imprimer » : imprimer le dossier tout juste créé.
+      if (window._printAfterSave && saved && saved.id != null) {
+        window._printAfterSave = false;
+        try { if (typeof printRecord === 'function') await printRecord(saved.id); } catch (e) {}
+      }
+      window._printAfterSave = false;
+      // ✅ v13.141 — Paillasse supprimée : on repart sur une fiche vierge.
+      if (typeof resetFicheIdentif === 'function') await resetFicheIdentif();
+    } else {
+      hideLoading();
+    }
+  } catch (e) {
+    hideLoading();
+    toast('Erreur : ' + (e.message || e), 'err');
+  }
+}
+
 // Modal de sélection du type à modifier pour les dossiers multi-analyses
 function showEditTypeModal(id, types) {
   let modal = document.getElementById('edit-type-modal');
@@ -1608,6 +1983,13 @@ function showEditTypeModal(id, types) {
 
 function cancelEdit() {
   _editingRecordId = null;
+  // ✅ v13.112 — sortir du mode « remplir tout sur une page »
+  _fillAllMode = false;
+  document.body.classList.remove('fill-all-mode');
+  document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = '');
+  // ✅ v13.114 — Ré-afficher les lignes masquées par hideUncheckedExamRows().
+  document.querySelectorAll('#zone-saisie tr, #zone-saisie .abg-row').forEach(row => { row.style.display = ''; });
+  { const pb = document.getElementById('btn-save-print'); if (pb) pb.style.display = 'none'; }
   // ✅ v13.34 — Restaurer updateMontantCurrent si gelé
   if (window._updateMontantCurrent_orig) {
     window.updateMontantCurrent = window._updateMontantCurrent_orig;
@@ -1743,8 +2125,13 @@ async function toggleRestriction(id) {
   const record = _dbCache.find(r => r.id === id);
   if (!record) { toast('Fiche introuvable', 'err'); return; }
 
-  // ✅ v13.82 — Verrouillage réservé à l'administrateur.
-  if (!isAdmin()) { toast('Le verrouillage est réservé à l\'administrateur', 'err'); return; }
+  // ✅ v13.116 — Un agent peut masquer/démasquer SES propres fiches ; l'admin,
+  // toutes. Un agent ne peut pas lever une restriction posée par l'admin.
+  const uid = _currentUser?.username;
+  if (!isAdmin()) {
+    if (record.createdBy !== uid) { toast('Vous ne pouvez masquer que vos propres fiches', 'err'); return; }
+    if (record.restrictedBy && record.restrictedBy !== uid) { toast('Fiche masquée par l\'administrateur', 'err'); return; }
+  }
 
   const isRestricted = !!record.restrictedBy;
   const confirmed = await showConfirmModal({
@@ -1902,6 +2289,20 @@ function loadResultsIntoForm(type, res) {
       setVal('sv_'+t.id, v.valeur);
       setVal('so_'+t.id, v.obs);
     });
+    // ✅ v13.135 — CRP, Widal et Groupe/Rh sont stockés SOUS « Immuno-Sérologie »
+    // par collectResults (onglet Sérologie) mais n'étaient PAS rechargés ici : une
+    // fiche CRP rouverte pour édition revenait vide. On les restaure désormais.
+    setSel('crp_valeur', res['CRP - Valeur']);
+    if (res['CRP - Valeur'] && typeof interpretCRP === 'function') interpretCRP();
+    if (typeof WIDAL_ANTIGENES !== 'undefined') {
+      WIDAL_ANTIGENES.forEach(ag => {
+        const w = res['Widal - ' + ag.name];
+        if (w) { setSel('widal_' + ag.id, w.titre); setSel('widal_cin_' + ag.id, w.cinetique); }
+      });
+      if (Object.keys(res).some(k => k.startsWith('Widal')) && typeof interpretWidal === 'function') interpretWidal();
+    }
+    setSel('gs_abo_hema', res['Groupe ABO']);
+    setSel('gs_rh_hema',  res['Rhésus']);
   }
   else if (type === 'Groupe sanguin') {
     setSel('gs_abo', res['Groupe ABO']);
