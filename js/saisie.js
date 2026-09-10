@@ -105,7 +105,13 @@ const CATALOGUE_EXAMENS = [
 // ✅ v12.4 — Paramètres attendus par examen coché (affichage "à compléter" sur la fiche)
 // Retourne [{key, name, unit, ref}] ; key = clé réelle dans l'objet resultats.
 function examExpectedRows(examId) {
-  const K = (arr) => arr.map(p => ({ key:p.name, name:p.name, unit:p.unit||'', ref:p.ref||p.refM||'' }));
+  // ✅ v13.94 — `getUnit` et non `p.unit` : une unité corrigée depuis
+  // Administration s'affichait à l'écran mais pas sur la feuille imprimée,
+  // le PDF ni l'Excel, qui lisaient tous le catalogue d'origine. Le patient
+  // repartait donc avec l'ancienne unité. On expose aussi `id`, pour que les
+  // consommateurs puissent redemander l'unité eux-mêmes si besoin.
+  const K = (arr) => arr.map(p => ({ key:p.name, name:p.name, id:p.id,
+                                     unit:getUnit(p.id, p.unit), ref:p.ref||p.refM||'' }));
   const M = {
     ex_nfs:   () => K([...HEMA_PARAMS.filter(p=>!['vs','ret'].includes(p.id)), ...HEMA_FL]),
     ex_vs:    () => K(HEMA_PARAMS.filter(p=>p.id==='vs')),
@@ -176,10 +182,27 @@ function collectPendingForType(res, coches) {
   let list = coches || [];
   if (!Array.isArray(list)) list = Object.values(list).flat();
   list.forEach(label => {
+    // ✅ v13.150 — Le FORFAIT prénatal n'est pas un examen mesurable : ne jamais
+    // le lister « à compléter » (ses composants le sont individuellement).
+    if (/pr[ée]natal/i.test(String(label))) return;
     const ex = cat.find(e => e.label === label);
     const rows = ex ? examExpectedRows(ex.id) : [];
     if (rows.length) {
-      if (!rows.some(r => isValFilled(res[r.key]))) out.push({ label, rows });
+      // ✅ v13.150 — « rempli » robuste : certaines clés de résultat diffèrent des
+      // clés attendues (groupe sanguin : « Groupe ABO »/« Rhésus » et non
+      // « GS - ABO »), et l'électrophorèse est remplie dès qu'un PROFIL est posé
+      // (sans forcément les pourcentages). Sans ça, ces examens ressortaient en
+      // double : rendus remplis PUIS re-listés vides « à compléter ».
+      let filled = rows.some(r => isValFilled(res[r.key]));
+      if (!filled && ex && ex.id === 'ex_gs') {
+        filled = isValFilled(res['Groupe ABO']) || isValFilled(res['Rhésus'])
+              || isValFilled(res['GS - ABO']) || isValFilled(res['GS - Rhésus']);
+      }
+      if (!filled && ex && ex.id === 'ex_ephb') {
+        filled = isValFilled(res['Profil Hb'])
+              || ['Hb A','Hb A2','Hb F','Hb S','Hb C','Hb D','Hb E'].some(k => isValFilled(res[k]));
+      }
+      if (!filled) out.push({ label, rows });
     } else {
       out.push({ label, rows: [{ key: null, name: label, unit: '', ref: '' }] });
     }
@@ -489,6 +512,26 @@ function restoreFicheFromRecord(record) {
   return true;
 }
 
+// ✅ v13.135 — RÉCUPÉRATION des dossiers sans « _examens_coches » (ancien format
+// OU dossier corrompu par une saisie en série d'une version antérieure qui avait
+// écrasé les métadonnées). On coche les examens dont AU MOINS un champ contient
+// déjà une valeur (résultats chargés dans le formulaire), pour que leurs panneaux
+// réapparaissent et que le total se recalcule. Le reste est déverrouillé par
+// l'appelant afin que l'utilisateur puisse re-cocher / compléter puis ré-enregistrer
+// (ce qui reconstruit « _examens_coches » et répare définitivement le dossier).
+function reconstruireCochesDepuisForm() {
+  let n = 0;
+  try {
+    getCatalogueComplet().forEach(ex => {
+      let fids; try { fids = examFieldIds(ex.id); } catch (e) { fids = []; }
+      if (!fids.length) return;
+      const rempli = fids.some(fid => { const el = document.getElementById(fid); return el && String(el.value).trim() !== ''; });
+      if (rempli) { const c = document.getElementById(ex.id); if (c && !c.checked) { c.checked = true; n++; } }
+    });
+  } catch (e) {}
+  return n;
+}
+
 function getPendingCheckedExams(record, type) {
   const res0 = record.resultats || {};
   // Cas composite : dossier multi-analyses agrégé (impression) → tous les types
@@ -645,14 +688,95 @@ function demarrerSaisie() {
   document.getElementById('fiche-identification').style.display = 'none';
   document.getElementById('zone-saisie').style.display = '';
 
-  // Activer le bon onglet (construit le panneau si ce n'est pas déjà fait)
-  switchTab(tabCible);
-
-  // Marquer d'une étoile rouge les sections correspondant aux examens payés
-  // (doit venir APRÈS switchTab pour que les sections existent dans le DOM)
-  markRequiredSections();
+  // ✅ v13.114 — Nouvelle saisie « tout sur une page » : après la fiche patient,
+  // on empile UNIQUEMENT les analyses cochées, sans onglets, sur une seule page.
+  // (tabCible n'est plus utilisé pour n'afficher qu'un seul onglet.)
+  void tabCible;
+  enterFillAllFresh();
 
   window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ✅ v13.114 — Vue « remplir tout sur une page » pour une NOUVELLE saisie
+// (juste après l'enregistrement des informations patient). Empile tous les
+// panneaux dont au moins un examen est coché, masque la barre d'onglets et
+// les sections non cochées, et n'affiche qu'un seul bouton d'enregistrement.
+// Réutilise la même mécanique que fillAllResults() (édition), mais sans dossier
+// existant : l'enregistrement passe par saveRecordAll() en mode création.
+function enterFillAllFresh() {
+  // Mode « tout sur une page » actif, mais PAS en édition (dossier neuf).
+  if (typeof _fillAllMode !== 'undefined') _fillAllMode = true;
+  if (typeof _editingRecordId !== 'undefined') _editingRecordId = null;
+  _locksDisabled = false;
+  document.body.classList.add('fill-all-mode');
+
+  // Construire tous les panneaux (les cartes doivent exister dans le DOM).
+  const order = (typeof TAB_ORDER !== 'undefined') ? TAB_ORDER
+              : ['hema','bio','bacterio','sero','parasito','gs','bpn'];
+  order.forEach(t => { try { if (typeof ensurePanelBuilt === 'function') ensurePanelBuilt(t); } catch (e) {} });
+
+  // Révéler les panneaux ayant au moins un examen coché ; masquer les autres.
+  order.forEach(tid => {
+    const panel = document.getElementById('panel-' + tid);
+    if (!panel) return;
+    const anyChecked = getCatalogueComplet().filter(ex => ex.tab === tid)
+      .some(ex => document.getElementById(ex.id)?.checked);
+    panel.classList.toggle('active', anyChecked);
+  });
+
+  // Verrous + sections : applyExamLocks masque les sections (sec-*) sans examen
+  // coché ; markRequiredSections ajoute l'étoile « requis ».
+  if (typeof applyExamLocks === 'function') applyExamLocks();
+  if (typeof markRequiredSections === 'function') markRequiredSections();
+  // ✅ v13.114 — Masquer aussi les LIGNES des examens non cochés à l'intérieur
+  // d'une carte partagée (ex. HbA1c dans « Biochimie sanguine », réticulocytes
+  // dans la NFS…) : on ne veut voir QUE les examens cochés, pas les lignes
+  // verrouillées des autres.
+  hideUncheckedExamRows();
+
+  // Boutons : un seul « Enregistrer les résultats » (masquer ceux par onglet).
+  document.querySelectorAll('button[onclick^="saveThenNext"]').forEach(b => b.style.display = 'none');
+  const bar = document.getElementById('save-all-bar');
+  if (bar) bar.style.display = 'block';               // toujours visible en « tout sur une page »
+  const btnAll = document.getElementById('btn-save-all');
+  if (btnAll) { btnAll.style.display = 'inline-flex'; btnAll.innerHTML = '💾 Enregistrer les résultats'; }
+  const hint = document.getElementById('save-all-hint');
+  if (hint) {
+    const labels = order
+      .filter(tid => getCatalogueComplet().some(ex => ex.tab === tid && document.getElementById(ex.id)?.checked))
+      .map(tid => (typeof TAB_TO_TYPE !== 'undefined' && TAB_TO_TYPE[tid]) || tid);
+    hint.textContent = labels.length + ' analyse' + (labels.length > 1 ? 's' : '') + ' à saisir : ' + labels.join(', ');
+  }
+}
+
+// ✅ v13.114 — Masque, dans la vue « tout sur une page », les lignes de résultat
+// qui n'appartiennent qu'à des examens NON cochés. Le masquage par section
+// (applyExamLocks) ne suffit pas quand plusieurs examens partagent une carte :
+// ex. « Biochimie sanguine » contient glycémie + HbA1c ; si seule la glycémie
+// est cochée, la ligne HbA1c restait visible mais verrouillée. On raisonne par
+// LIGNE : une ligne reste visible dès qu'au moins un des examens qui la possèdent
+// est coché. À n'appeler que dans les vues empilées (fill-all).
+function hideUncheckedExamRows() {
+  let cat;
+  try { cat = getCatalogueComplet(); } catch (e) { return; }
+  // Pour chaque champ : est-il possédé par au moins un examen coché ?
+  const ownedByChecked = {};
+  cat.forEach(ex => {
+    const on = !!document.getElementById(ex.id)?.checked;
+    let fids; try { fids = examFieldIds(ex.id); } catch (e) { fids = []; }
+    fids.forEach(fid => { ownedByChecked[fid] = (ownedByChecked[fid] || false) || on; });
+  });
+  // Agréger au niveau de la LIGNE conteneur (tr / .abg-row) : on garde la ligne
+  // si au moins un de ses champs catalogués est possédé par un examen coché.
+  const rowKeep = new Map();
+  Object.keys(ownedByChecked).forEach(fid => {
+    const el = document.getElementById(fid);
+    if (!el) return;
+    const row = el.closest('tr, .abg-row');
+    if (!row) return;
+    rowKeep.set(row, (rowKeep.get(row) || false) || ownedByChecked[fid]);
+  });
+  rowKeep.forEach((keep, row) => { row.style.display = keep ? '' : 'none'; });
 }
 
 // Marque les sections/cartes correspondant aux examens cochés (payés)
@@ -818,12 +942,16 @@ async function enregistrerFicheIdentif() {
       _examens_prix[t] = prixParTab[tab];
     });
 
+    // ✅ v13.125 — « Réception seule » : le dossier est enregistré mais exclu de
+    // la grille de saisie en série (jusqu'à ce qu'on l'y remette).
+    const receptionSeule = !!document.getElementById('chk-reception-seule')?.checked;
     const resultats = {
       _types: Object.keys(_montants),
       _montants,
       _examens_coches,
       _examens_prix,
       _facture_seule: true, // marqueur : résultats non encore saisis
+      _reception_seule: receptionSeule,
     };
 
     const prescripteur_id = document.getElementById('p_prescripteur_id')?.value || null;
@@ -840,6 +968,7 @@ async function enregistrerFicheIdentif() {
         _examens_coches: resultats._examens_coches,
         _examens_prix:   resultats._examens_prix,
         _facture_seule:  !(existing?.resultats) || existing.resultats._facture_seule,
+        _reception_seule: receptionSeule, // ✅ v13.125 — reflète la case au moment de la mise à jour
       };
       const updatedRecord = {
         // ✅ v13.36 — TOUJOURS 'Dossier' : un dossier multi-analyses doit
@@ -853,8 +982,11 @@ async function enregistrerFicheIdentif() {
         prescripteur_id,
         est_bpn: false,
       };
-      await updateRecordRemote(_editingFicheId, updatedRecord);
+      // ✅ v13.129 — Ne confirmer que si la mise à jour a réellement abouti
+      // (journée verrouillée → updateRecordRemote renvoie null et a prévenu).
+      const majOk = await updateRecordRemote(_editingFicheId, updatedRecord);
       hideLoading();
+      if (!majOk) { return; }
       toast('✅ Fiche d\'accueil mise à jour — N° ' + (p.dossier || ''), 'ok');
       _editingFicheId = null;
       // Nettoyer le bandeau et le bouton
@@ -868,7 +1000,18 @@ async function enregistrerFicheIdentif() {
       // ✅ v13.37 — Garde-fou anti-doublon : un dossier ACTIF avec ce numéro
       // existe déjà (double-clic, ré-enregistrement…). On propose un nouveau
       // numéro plutôt que de créer un doublon.
-      const _dup = getDB().find(rr => rr.patient?.dossier === p.dossier && !rr.deletedAt && !rr._hardDeleted);
+      // ✅ v13.110 — Renforcement anti-doublon inter-postes/hors-ligne :
+      //   1) On RAFRAÎCHIT le cache depuis le serveur juste avant de contrôler,
+      //      pour fermer la fenêtre entre l'aperçu du numéro (ouverture de la
+      //      fiche) et l'enregistrement — c'est là que deux postes, ou un poste
+      //      au cache périmé / revenu en ligne, réattribuaient le même numéro.
+      //   2) On contrôle sur le cache COMPLET (retourné par refreshDB), et non
+      //      getDB() qui masque les fiches restreintes par d'autres profils :
+      //      une collision avec l'une d'elles passait inaperçue.
+      let _cacheComplet;
+      try { _cacheComplet = await refreshDB(true); }
+      catch (e) { _cacheComplet = (typeof getDB === 'function' ? getDB() : []); }
+      const _dup = (_cacheComplet || []).find(rr => rr.patient?.dossier === p.dossier && !rr.deletedAt && !rr._hardDeleted);
       if (_dup) {
         hideLoading();
         const _ok = await showConfirmModal({
@@ -892,8 +1035,12 @@ async function enregistrerFicheIdentif() {
         prescripteur_id,
         est_bpn: false,
       };
-      await insertRecordRemote(record);
+      // ✅ v13.129 — Vérifier que l'enregistrement a RÉELLEMENT réussi. Sur une
+      // journée verrouillée (ou toute erreur), insertRecordRemote renvoie null
+      // et a déjà affiché la raison ; on ne doit PAS annoncer « enregistré ».
+      const saved = await insertRecordRemote(record);
       hideLoading();
+      if (!saved) { return; }
       toast('Facture enregistrée ✓ — résultats à compléter plus tard', 'ok');
       await refreshDB(true);
       // ✅ v13.37 — Nouveau patient enregistré depuis la caisse → retour à la caisse
